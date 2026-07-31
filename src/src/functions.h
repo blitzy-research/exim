@@ -138,6 +138,7 @@ extern uschar *bdat_getbuf(unsigned *);
 extern BOOL    bdat_hasc(void);
 extern int     bdat_ungetc(int);
 extern void    bdat_flush_data(void);
+extern void    bdat_invalidate_receive_functions(void);
 
 extern void    bits_clear(unsigned int *, size_t, int *);
 extern void    bits_set(unsigned int *, size_t, int *);

@@ -1,0 +1,5 @@
+2026-07-31: we identified a use-after-free in the gnutls tls backend by code inspection
+2026-07-31: remediation and a regression test prepared
+planned:
+2026-08-04 15:00UTC: publish the fix via the distros repo (accessible for the distro packagers)
+2026-08-07 15:00UTC: publish the fix via the default repo (accessible for the public)
