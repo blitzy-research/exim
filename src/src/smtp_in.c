@@ -961,6 +961,43 @@ lwr_receive_hasc = NULL;
 lwr_receive_ungetc = NULL;
 }
 
+
+/* Invalidate any saved lower-layer receive functions that refer to a TLS
+session which is being torn down.  Called from tls_close() so that the transfer
+buffer and the reader functions bound to it cannot outlive one another: once the
+buffer has been released, nothing reachable from here may read or write it.
+
+The saved vector is REMAPPED onto the plain smtp_* readers rather than nulled.
+Nulling would be wrong: the four dispatch sites (in bdat_getc(), bdat_hasc(),
+bdat_getbuf() and bdat_ungetc()) call through these pointers unconditionally, so
+a null vector would turn a stale-pointer use into a null function-pointer call.
+The smtp_* readers operate on the plain socket and are exactly what tls_close()
+installs into the top-level receive_* vector, so a subsequent
+bdat_pop_receive_functions() restores a consistent state.
+
+Only an already-pushed vector is rewritten.  That preserves the invariant that a
+null lwr_receive_getc means "not pushed", which bdat_push_receive_functions()
+and bdat_pop_receive_functions() both rely on; no push/pop bookkeeping is
+disturbed and no double-push or double-pop is provoked.  Consequently this is
+safe to call when CHUNKING was never used, and it is idempotent, so repeated
+teardowns on one connection are harmless.
+
+Arguments:  none
+Returns:    nothing
+*/
+
+void
+bdat_invalidate_receive_functions(void)
+{
+if (lwr_receive_getc)
+  {
+  lwr_receive_getc = smtp_getc;
+  lwr_receive_getbuf = smtp_getbuf;
+  lwr_receive_hasc = smtp_hasc;
+  lwr_receive_ungetc = smtp_ungetc;
+  }
+}
+
 int
 bdat_ungetc(int ch)
 {
