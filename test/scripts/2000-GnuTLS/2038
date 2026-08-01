@@ -1,0 +1,60 @@
+# TLS server, CHUNKING reception with TLS shutdown mid-chunk
+gnutls
+#
+# The client opens a chunk of 88 bytes, sends only 20 of them, and then shuts
+# the TLS session down while leaving the TCP connection open.  That leaves the
+# server in the middle of a BDAT command with 68 bytes still outstanding, so its
+# body reader is still dispatching through the readers installed for the TLS
+# session at the moment that session, and the transfer buffer those readers work
+# on, are released.
+#
+# Reading has to stop there.  Going on would either reach into the released
+# buffer or - just as bad - read the remainder of the connection in clear, on
+# the socket the peer negotiated encryption for.  So what is expected below is
+# the lost-connection response and then end of file: no further command may be
+# taken in clear, and the daemon must not be left reading for the rest of the
+# chunk until the receive timeout expires.
+#
+exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
+****
+#
+# Chunk arithmetic: 88 declared, 20 sent.  "To: Susan@random.com" is 20 bytes and
+# the ">>> " prefix suppresses the trailing CRLF, so 68 bytes of the chunk never
+# arrive and the header line is left unterminated.  Stopping short of the line
+# ending matters: a chunk whose first header line does end, but with a bare LF,
+# is refused outright with "552 Message header not CRLF terminated" as soon as
+# that line is complete, which would answer a question about header syntax
+# instead of the one this test asks.
+#
+client-anytls 127.0.0.1 PORT_D
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+STARTTLS
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250 HELP
+MAIL FROM:<someone@some.domain>
+??? 250
+RCPT TO:<CALLER@test.ex>
+??? 250
+BDAT 88 LAST
+>>> To: Susan@random.com
+stoptls
+??? 421
+???*
+****
+millisleep 500
+killdaemon
+no_msglog_check
