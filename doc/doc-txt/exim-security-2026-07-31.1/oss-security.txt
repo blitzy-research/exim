@@ -1,0 +1,62 @@
+Subject: [oss-security] EXIM-Security-2026-07-31.1: Exim 4.100: Remote heap
+ corruption, GnuTLS backend
+To: oss-security <oss-security@lists.openwall.com>
+MIME-Version: 1.0
+Content-Transfer-Encoding: 8bit
+Content-Type: text/plain; charset=utf-8
+
+Dear Exim users,
+
+we have identified, by code inspection, a use-after-free in the GnuTLS backend
+of our SMTP server, reached when a TLS session is torn down while a chunked
+body transfer - BDAT, from the CHUNKING extension - is still in progress.  The
+transfer buffer is released and the session destroyed while the reader
+callbacks bound to them stay installed and keep being dispatched: a remote,
+unauthenticated attacker can have up to 4096 bytes of their own decoded into a
+freed heap allocation, once per refill for the rest of the declared chunk, on a
+stock build with a stock configuration and without credentials.
+
+Only GnuTLS builds are subject to the heap corruption; an OpenSSL build never
+releases that buffer, and its equivalent stale-reader path merely crashes the
+one forked per-connection process - closed by this fix as well, the corrected
+code being shared, and that backend itself was not touched.  The technical
+detail is in the report filed beside this notification.
+
+The defect is present in the 4.100 development tree and, on the evidence of our
+own release record, in all preceding releases that shipped the GnuTLS backend
+with CHUNKING support.  Please note that bound: the exact earliest affected
+release cannot be established without access to external project history, so we
+deliberately do not narrow the claim further.
+
+The remedy gives buffer, session handle and the readers working on both a
+single lifetime.  Both pointers are cleared as their objects are released and
+the transfer state is reset with them, the saved chunked-body receive functions
+no longer refer to the TLS readers, and the routines using any of them fail
+closed.  Unchanged: public API and ABI, the protocol on the wire, the spool
+file format, every configuration option and default value.
+
+One behaviour changes deliberately.  A peer that tears down TLS mid-chunk while
+holding the TCP socket open previously had its subsequent traffic read in clear
+on that socket; the read path now fails closed, so that traffic is not read and
+no further SMTP command is accepted.  A terminal failure response still goes
+out before the connection closes - the claim is about what we read, not about
+what we send.  Well-behaved clients never traverse this path.
+
+Please install a build containing the fix once it is published; we name no
+release number here.  The one workaround is a compensating control and not a
+fix: restricting chunking_advertise_hosts so that CHUNKING is not advertised
+removes the trigger, but it takes an explicit configuration action, the
+option's default value being "*", withdraws a standards-defined SMTP
+capability, and leaves the defect in the code.  For how we handle security
+releases and vendor backports see <https://wiki.exim.org/EximSecurity> and
+<https://wiki.exim.org/SecurityReleaseProcess>.
+
+We assert no public identifier for this defect: no CVE identifier, no severity
+score, no advisory reference.  Any severity characterisation from us is a
+code-derived assessment, unverified against NVD, MITRE or any vendor advisory.
+
+2026-07-31: we identified a use-after-free in the gnutls tls backend by code inspection
+2026-07-31: remediation prepared
+
+~2026-08-04 15:00UTC: publish the fix via the distros repo (accessible for the distro packagers)
+~2026-08-07 15:00UTC: publish the fix via the default repo (accessible for the public)
