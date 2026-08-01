@@ -4018,10 +4018,9 @@ if (!ct_ctx)	/* server */
   transfer saves the readers it displaced and keeps dispatching through that
   saved vector, and its pop would even reinstate them as the top-level readers.
   Retire the TLS readers from there too, before the buffer they are bound to is
-  released below - and, in the same call, mark the plain-socket input closed.
-  The plain readers just reinstated would otherwise carry the dialogue on in
-  clear, and end-of-file has to be visible through receive_feof(), which from
-  here on is smtp_feof(). */
+  released below.  The helper remaps that saved vector onto the plain-socket
+  readers rather than clearing it, because the chunked-body dispatch sites call
+  through it without testing it first. */
 
   bdat_invalidate_receive_functions();
   }
@@ -4041,21 +4040,28 @@ if (state->xfer_buffer) store_free(state->xfer_buffer);
 
 /* Clearing the pointer is what makes the guard above, and the ones in the read
 routines, mean anything, and zeroing the water marks stops the buffered-data
-fast paths from indexing a buffer that is no longer there.  Recording the
-end-of-file also gives that flag, which nothing has ever set, a value.
-
-The end-of-file and error latches are set unconditionally, so that the read
-routines fail closed for the rest of this session rather than reverting to the
-plain socket.  Reading on is not an option: what arrives next would be read in
-clear on the connection the peer negotiated encryption for, and the session
-whose bytes were being decoded is gone.  A later handshake on this same
-connection is unaffected, because the allocation sites clear these fields for
-the session they start.  Nothing reads a client context's copy of them, so
-there is no need to distinguish the two cases here. */
+fast paths from indexing a buffer that is no longer there. */
 
 state->xfer_buffer = NULL;
 state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
-state->xfer_eof = state->xfer_error = TRUE;
+
+/* A shutdown part-way through a chunked message body must not let the rest of
+that body go on being read: latch the error, so that the read routines report
+the end of their input rather than taking the remainder of the message from the
+plain socket, in clear, on a connection the peer negotiated encryption for.  The
+end-of-file flag is latched with it; nothing has ever set that flag, which left
+tls_feof() unable to report the end of this input at all.  A later handshake on
+this same connection is unaffected, because both allocation sites clear the pair
+for the session they start.
+
+The latch is confined to a body transfer in progress.  At a command boundary the
+plain handling deliberately stays available: a peer may shut the session down
+between messages and carry on with a fresh EHLO in clear, which is how an open
+connection is handed on between delivery processes, and failing that closed
+would break ordinary delivery rather than any attack. */
+
+if (chunking_state > CHUNKING_OFFERED)
+  state->xfer_eof = state->xfer_error = TRUE;
 }
 
 
@@ -4087,14 +4093,15 @@ clear as if it were a continuation of the encrypted session. */
 
 if (!state->session || !state->xfer_buffer) return EOF;
 
-/* A refill that fails has always recorded the reason in xfer_error, so there is
-nothing to be gained by consulting it: the answer is end-of-file either way.
-Falling back to the plain-socket reader would read the rest of the connection
-in clear after the session carrying it had gone. */
+/* A failed refill that recorded an error - a read timeout, a library failure, or
+a teardown part-way through a chunked message body - is the end of this input:
+answer end-of-file rather than reading the remainder of that body in clear from
+the plain socket.  A teardown at a command boundary records no error, and there
+the plain reader is the correct continuation, as it has always been. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(lim))
-    return EOF;
+    return state->xfer_error ? EOF : smtp_getc(lim);
 
 /* Something in the buffer; return next uschar */
 
@@ -4124,12 +4131,14 @@ if (!state->session || !state->xfer_buffer)
   return NULL;
   }
 
-/* As in tls_getc() above: a failed refill is the end of this input, and reading
-on from the plain socket would be reading in clear. */
+/* As in tls_getc() above: a refill that failed with an error recorded is the end
+of this input, while one that did not is a teardown at a command boundary, where
+the plain reader is the correct continuation. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(*len))
     {
+    if (!state->xfer_error) return smtp_getbuf(len);
     *len = 0;
     return NULL;
     }
