@@ -4045,22 +4045,33 @@ fast paths from indexing a buffer that is no longer there. */
 state->xfer_buffer = NULL;
 state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
 
-/* A shutdown part-way through a chunked message body must not let the rest of
-that body go on being read: latch the error, so that the read routines report
-the end of their input rather than taking the remainder of the message from the
-plain socket, in clear, on a connection the peer negotiated encryption for.  The
-end-of-file flag is latched with it; nothing has ever set that flag, which left
-tls_feof() unable to report the end of this input at all.  A later handshake on
-this same connection is unaffected, because both allocation sites clear the pair
-for the session they start.
+/* A shutdown part-way through taking a message must not let the rest of that
+message go on being read: latch the error, so that the read routines report the
+end of their input rather than taking the remainder from the plain socket, in
+clear, on a connection the peer negotiated encryption for.  The end-of-file flag
+is latched with it; nothing has ever set that flag, which left tls_feof() unable
+to report the end of this input at all.  A later handshake on this same
+connection is unaffected, because both allocation sites clear the pair for the
+session they start.
 
-The latch is confined to a body transfer in progress.  At a command boundary the
-plain handling deliberately stays available: a peer may shut the session down
-between messages and carry on with a fresh EHLO in clear, which is how an open
-connection is handed on between delivery processes, and failing that closed
-would break ordinary delivery rather than any attack. */
+A chunked body transfer in progress is the obvious case but not the only one: a
+chunk that has just been completed leaves the chunking state back at merely
+offered while the transaction it belongs to is still open, and the next chunk of
+that same message must not be allowed to arrive in clear either.  An open
+transaction is therefore latched on as well.
 
-if (chunking_state > CHUNKING_OFFERED)
+What stays deliberately outside the latch is a shutdown at a command boundary
+with no message in hand.  A peer may shut the session down between messages and
+carry on with a fresh EHLO in clear - that is how an open connection is handed on
+between delivery processes - and the start of message handling resets the
+transaction before any command is read, so the tests below are false there and
+the plain handling remains available.  Failing that closed would break ordinary
+delivery rather than any attack. */
+
+if (  chunking_state > CHUNKING_OFFERED
+   || sender_address			/* transaction in progress */
+   || recipients_count > 0
+   )
   state->xfer_eof = state->xfer_error = TRUE;
 }
 
@@ -4094,10 +4105,11 @@ clear as if it were a continuation of the encrypted session. */
 if (!state->session || !state->xfer_buffer) return EOF;
 
 /* A failed refill that recorded an error - a read timeout, a library failure, or
-a teardown part-way through a chunked message body - is the end of this input:
-answer end-of-file rather than reading the remainder of that body in clear from
-the plain socket.  A teardown at a command boundary records no error, and there
-the plain reader is the correct continuation, as it has always been. */
+a teardown while a message was being taken - is the end of this input: answer
+end-of-file rather than reading the remainder of that message in clear from the
+plain socket.  A teardown at a command boundary with no message in hand records
+no error, and there the plain reader is the correct continuation, as it has
+always been. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(lim))
@@ -4132,8 +4144,8 @@ if (!state->session || !state->xfer_buffer)
   }
 
 /* As in tls_getc() above: a refill that failed with an error recorded is the end
-of this input, while one that did not is a teardown at a command boundary, where
-the plain reader is the correct continuation. */
+of this input, while one that did not is a teardown at a command boundary with no
+message in hand, where the plain reader is the correct continuation. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(*len))

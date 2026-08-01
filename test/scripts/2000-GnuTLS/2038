@@ -1,30 +1,52 @@
 # TLS server, CHUNKING reception with TLS shutdown mid-chunk
 gnutls
 #
-# The client opens a chunk of 88 bytes, sends only 20 of them, and then shuts
-# the TLS session down while leaving the TCP connection open.  That leaves the
-# server in the middle of a BDAT command with 68 bytes still outstanding, so its
-# body reader is still dispatching through the readers installed for the TLS
-# session at the moment that session, and the transfer buffer those readers work
-# on, are released.
+# A TLS session that goes away while a BDAT chunk is still being read leaves the
+# server holding readers, and a transfer buffer, belonging to a session that has
+# ceased to exist.  Reading has to stop there.  Going on would either reach into
+# the released buffer or read the rest of the connection in clear, on the socket
+# the peer negotiated encryption for.
 #
-# Reading has to stop there.  Going on would either reach into the released
-# buffer or - just as bad - read the remainder of the connection in clear, on
-# the socket the peer negotiated encryption for.  So what is expected below is
-# the lost-connection response and then end of file: no further command may be
-# taken in clear, and the daemon must not be left reading for the rest of the
-# chunk until the receive timeout expires.
+# So the reply expected below is the lost-connection one: no further byte of the
+# chunk may be taken from the plain socket, no message may be accepted, and the
+# daemon must not be left waiting out the receive timeout for a chunk that will
+# never be finished.  The reply is matched in full rather than as just "421"
+# because that timeout answers with a 421 of its own, and a loose match would be
+# satisfied by the very behaviour this test exists to reject.
+#
+# Note for running this by hand: the daemon under test has to be the GnuTLS
+# build, which is what runtest uses at both ends when no --tls option is given.
+# "--tls gnutls" chooses the library for the client and puts the other build on
+# the server side, where none of this applies.  Test numbers spanning more than
+# one script directory have to be asked for as a range, or one batch per
+# directory.
 #
 exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
 ****
 #
-# Chunk arithmetic: 88 declared, 20 sent.  "To: Susan@random.com" is 20 bytes and
-# the ">>> " prefix suppresses the trailing CRLF, so 68 bytes of the chunk never
-# arrive and the header line is left unterminated.  Stopping short of the line
-# ending matters: a chunk whose first header line does end, but with a bare LF,
-# is refused outright with "552 Message header not CRLF terminated" as soon as
-# that line is complete, which would answer a question about header syntax
-# instead of the one this test asks.
+# Chunk arithmetic - 85 declared, 84 sent, so one byte is still outstanding when
+# the session goes.  The ">>> " prefix suppresses the trailing CRLF the client
+# would otherwise add, so the payload is exactly the text after it:
+#
+#     To: Susan@random.com CRLF      22
+#     From: Sam@random.com CRLF      22   (44)
+#     CRLF, ending the header block   2   (46)
+#     body-start-                    11   (57)
+#     27 x A                         27   (84)
+#
+# Both halves of that shape are load-bearing.  The header block has to be
+# complete, so that reception is past the header lines and into the body: that is
+# where the end of a chunk is handled by pushing a byte back through the saved
+# readers, which writes into the transfer buffer.  And the chunk has to be short
+# by exactly one byte, that byte then being offered in clear once the session has
+# gone - a server that still reads the plain socket takes it, finishes the chunk,
+# and performs the push-back.  Leave either half out and the reader never gets
+# that far, so a build carrying the fault would look every bit as healthy as one
+# without it.
+#
+# The connection is not read again after the reply.  The byte offered in clear is
+# deliberately never consumed, so the close that follows carries a reset, and a
+# further read would report that reset rather than end of file.
 #
 client-anytls 127.0.0.1 PORT_D
 ??? 220
@@ -49,11 +71,11 @@ MAIL FROM:<someone@some.domain>
 ??? 250
 RCPT TO:<CALLER@test.ex>
 ??? 250
-BDAT 88 LAST
->>> To: Susan@random.com
+BDAT 85 LAST
+>>> To: Susan@random.com\r\nFrom: Sam@random.com\r\n\r\nbody-start-AAAAAAAAAAAAAAAAAAAAAAAAAAA
 stoptls
-??? 421
-???*
+>>> X
+??? 421 Lost incoming connection
 ****
 millisleep 500
 killdaemon
