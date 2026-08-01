@@ -349,6 +349,7 @@ static uschar *smtp_inptr;
 static uschar *smtp_inend;
 static int     smtp_had_eof;
 static int     smtp_had_error;
+static int     smtp_input_closed;	/* input retired; do not read the socket again */
 
 
 /* forward declarations */
@@ -461,7 +462,7 @@ if (!(smtp_inbuffer = US malloc(IN_BUFFER_SIZE)))
 smtp_inbuffer[IN_BUFFER_SIZE-1] = '\0';
 
 smtp_inptr = smtp_inend = smtp_inbuffer;
-smtp_had_eof = smtp_had_error = 0;
+smtp_had_eof = smtp_had_error = smtp_input_closed = 0;
 }
 
 
@@ -495,6 +496,15 @@ int rc, save_errno;
 if (smtp_out_fd < 0 || smtp_in_fd < 0) return FALSE;
 
 smtp_fflush(SFF_UNCORK);
+
+/* A TLS session torn down mid-connection retires this input: the plain readers
+the teardown falls back to share the socket the peer negotiated encryption for,
+so reading it again would carry the dialogue on in clear.  Nothing else sets
+this, so a plain connection reaching its own end-of-file still takes the read
+below and reports it exactly as it always has. */
+
+if (smtp_input_closed) return FALSE;
+
 if (smtp_receive_timeout > 0) ALARM(smtp_receive_timeout);
 
 /* Limit amount read, so non-message data is not fed to DKIM.
@@ -962,25 +972,41 @@ lwr_receive_ungetc = NULL;
 }
 
 
-/* Invalidate any saved lower-layer receive functions that refer to a TLS
-session which is being torn down.  Called from tls_close() so that the transfer
-buffer and the reader functions bound to it cannot outlive one another: once the
-buffer has been released, nothing reachable from here may read or write it.
+/*************************************************
+*       Remap saved lower-layer receive fns      *
+*************************************************/
 
-The saved vector is REMAPPED onto the plain smtp_* readers rather than nulled.
-Nulling would be wrong: the four dispatch sites (in bdat_getc(), bdat_hasc(),
-bdat_getbuf() and bdat_ungetc()) call through these pointers unconditionally, so
-a null vector would turn a stale-pointer use into a null function-pointer call.
-The smtp_* readers operate on the plain socket and are exactly what tls_close()
-installs into the top-level receive_* vector, so a subsequent
-bdat_pop_receive_functions() restores a consistent state.
+/* Called when the server-side TLS session is torn down, to retire the TLS
+readers from the receive path and to record that the input carried by that
+session has ended.
 
-Only an already-pushed vector is rewritten.  That preserves the invariant that a
-null lwr_receive_getc means "not pushed", which bdat_push_receive_functions()
-and bdat_pop_receive_functions() both rely on; no push/pop bookkeeping is
-disturbed and no double-push or double-pop is provoked.  Consequently this is
-safe to call when CHUNKING was never used, and it is idempotent, so repeated
-teardowns on one connection are harmless.
+The BDAT layer displaces the receive_* function vector and keeps its own copy of
+what it displaced, dispatching through that copy for the duration of a chunked
+message body.  When the copy holds TLS readers and the session they work on is
+closed down, every further dispatch would reach into storage that has been
+released - and the pop above would promote those same readers back to being the
+primary ones.  Calling this from the TLS shutdown path keeps the saved copy from
+outliving what it refers to.
+
+The saved functions are remapped onto the plain SMTP readers - exactly what the
+teardown also installs as the top-level receive_* vector - rather than cleared:
+all four dispatch sites make an unguarded indirect call, so a cleared vector
+would leave those calls going through NULL.  Only a vector that has actually been
+pushed is touched, so a null lwr_receive_getc keeps its meaning as the "nothing
+pushed" state that the push and pop above both key on; were it populated here, a
+later push would save the bdat_* functions on top of themselves.
+
+Recording the end of the input is the other half of the job, and is done whether
+or not a chunked transfer was under way.  Two things have to hold.  The socket
+must not be read again: the plain readers being reinstated here and by the
+teardown share the connection the peer negotiated encryption for, so a further
+read would carry the dialogue on in clear.  And the end of the input has to be
+observable through receive_feof(), which teardown points at smtp_feof(), or a
+peer that vanishes between a header line and the lookahead for its continuation
+would look like one that finished its message.  Keeping the two in separate flags
+leaves an ordinary end-of-file on a plain connection reading and reporting as
+before.  A later session on this connection re-runs smtp_buf_init(), which clears
+both again.
 
 Arguments:  none
 Returns:    nothing
@@ -989,14 +1015,16 @@ Returns:    nothing
 void
 bdat_invalidate_receive_functions(void)
 {
-if (lwr_receive_getc)
-  {
-  lwr_receive_getc = smtp_getc;
-  lwr_receive_getbuf = smtp_getbuf;
-  lwr_receive_hasc = smtp_hasc;
-  lwr_receive_ungetc = smtp_ungetc;
-  }
+smtp_had_eof = smtp_input_closed = 1;
+
+if (!lwr_receive_getc) return;
+
+lwr_receive_getc = smtp_getc;
+lwr_receive_getbuf = smtp_getbuf;
+lwr_receive_hasc = smtp_hasc;
+lwr_receive_ungetc = smtp_ungetc;
 }
+
 
 int
 bdat_ungetc(int ch)

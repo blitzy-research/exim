@@ -3971,6 +3971,12 @@ tls_support * tlsp = state->tlsp;
 
 if (!tlsp || tlsp->active.sock < 0) return;  /* TLS was not active */
 
+/* A close-down alert can only be written while the session object it belongs to
+still exists.  It no longer does for a context whose session has been given up:
+the ATRN transplant hands the session to the other context and leaves this one
+with a socket field of zero rather than a negative one, so the test above does
+not stop us getting here. */
+
 if (do_shutdown && state->session)
   {
   DEBUG(D_tls) debug_printf("tls_close(): shutting down TLS%s\n",
@@ -4008,11 +4014,14 @@ if (!ct_ctx)	/* server */
   receive_feof =	smtp_feof;
   receive_ferror =	smtp_ferror;
 
-  /* Resetting the vector above is not enough: while a chunked (BDAT) transfer
-  is in progress the bdat_* readers are installed there, and they dispatch
-  through a separately saved lower-layer vector which still holds our readers.
-  Deregister those too, so that nothing can be dispatched against the session
-  and buffer we are about to release. */
+  /* Resetting the vector above is not enough on its own: a chunked-body
+  transfer saves the readers it displaced and keeps dispatching through that
+  saved vector, and its pop would even reinstate them as the top-level readers.
+  Retire the TLS readers from there too, before the buffer they are bound to is
+  released below - and, in the same call, mark the plain-socket input closed.
+  The plain readers just reinstated would otherwise carry the dialogue on in
+  clear, and end-of-file has to be visible through receive_feof(), which from
+  here on is smtp_feof(). */
 
   bdat_invalidate_receive_functions();
   }
@@ -4028,36 +4037,25 @@ tlsp->active.tls_ctx = NULL;
 tlsp->channelbinding = NULL;
 
 
-/* Release the transfer buffer, and leave nothing behind that designates it.
-The consumers all check the pointer, so nulling it is what makes them fail
-closed; zeroing the water marks does the same for the index-based fast paths
-and for the ungetc underflow check.
+if (state->xfer_buffer) store_free(state->xfer_buffer);
 
-Latching the end-of-file and error flags additionally makes tls_getc() report
-EOF for the call that is in flight when the teardown happens, instead of
-returning a byte read in clear from the same socket.  We do that only while
-a chunked body transfer is mid-chunk, which is the case this defect is
-about: body bytes are still being consumed, so carrying on in clear would
-splice unprotected input into a message the session had protected, and it
-is the read loop that kept re-entering the released buffer.
+/* Clearing the pointer is what makes the guard above, and the ones in the read
+routines, mean anything, and zeroing the water marks stops the buffered-data
+fast paths from indexing a buffer that is no longer there.  Recording the
+end-of-file also gives that flag, which nothing has ever set, a value.
 
-Outside a mid-chunk transfer we must not latch.  A peer may shut TLS down
-at a command boundary and continue on the same connection, and our own
-SMTP transport does exactly that when hosts_noproxy_tls matches: it closes
-TLS, sends a fresh EHLO in clear and requires a 2xx before it passes the
-connection on for a continued delivery.  Failing that read closed would
-break delivery.  The lifetime hygiene above is what removes the dangling
-references, so it is applied unconditionally, while the read-path latch is
-scoped to the transfer that can be corrupted. */
+The end-of-file and error latches are set unconditionally, so that the read
+routines fail closed for the rest of this session rather than reverting to the
+plain socket.  Reading on is not an option: what arrives next would be read in
+clear on the connection the peer negotiated encryption for, and the session
+whose bytes were being decoded is gone.  A later handshake on this same
+connection is unaffected, because the allocation sites clear these fields for
+the session they start.  Nothing reads a client context's copy of them, so
+there is no need to distinguish the two cases here. */
 
-if (state->xfer_buffer)
-  {
-  store_free(state->xfer_buffer);
-  state->xfer_buffer = NULL;
-  }
+state->xfer_buffer = NULL;
 state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
-if (!ct_ctx && chunking_state >= CHUNKING_ACTIVE)
-  state->xfer_eof = state->xfer_error = TRUE;
+state->xfer_eof = state->xfer_error = TRUE;
 }
 
 
@@ -4082,15 +4080,21 @@ tls_getc(unsigned lim)
 {
 exim_gnutls_state_st * state = &state_server;
 
-/* The buffer is released, and the pointer nulled, by tls_close(); a stale
-reader reaching us afterwards must see end-of-file rather than the contents of
-released memory. */
+/* The buffer and the session are released together by tls_close(), which nulls
+both pointers; a stale reader reaching us afterwards must see end-of-file rather
+than the contents of released memory, and must not read the socket underneath in
+clear as if it were a continuation of the encrypted session. */
 
-if (!state->xfer_buffer) return EOF;
+if (!state->session || !state->xfer_buffer) return EOF;
+
+/* A refill that fails has always recorded the reason in xfer_error, so there is
+nothing to be gained by consulting it: the answer is end-of-file either way.
+Falling back to the plain-socket reader would read the rest of the connection
+in clear after the session carrying it had gone. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(lim))
-    return state->xfer_error ? EOF : smtp_getc(lim);
+    return EOF;
 
 /* Something in the buffer; return next uschar */
 
@@ -4111,19 +4115,21 @@ exim_gnutls_state_st * state = &state_server;
 unsigned size;
 uschar * buf;
 
-/* Released buffer: report nothing available.  This also stops an interior
-pointer into the buffer escaping to the caller after teardown. */
+/* Released session or buffer: report nothing available.  This also stops an
+interior pointer into the buffer escaping to the caller after teardown. */
 
-if (!state->xfer_buffer)
+if (!state->session || !state->xfer_buffer)
   {
   *len = 0;
   return NULL;
   }
 
+/* As in tls_getc() above: a failed refill is the end of this input, and reading
+on from the plain socket would be reading in clear. */
+
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(*len))
     {
-    if (!state->xfer_error) return smtp_getbuf(len);
     *len = 0;
     return NULL;
     }
@@ -4194,8 +4200,9 @@ tls_read(void * ct_ctx, uschar *buff, size_t len)
 exim_gnutls_state_st * state = ct_ctx ? ct_ctx : &state_server;
 ssize_t inbytes;
 
-/* Destroyed session: report a failed read rather than using an expired
-library handle. */
+/* Report a failed read once the session has been closed down.  Only the
+session is tested: a client context never allocates a transfer buffer, so the
+absence of one is normal on that path. */
 
 if (!state->session) return -1;
 
@@ -4258,6 +4265,13 @@ tls_write(void * ct_ctx, const uschar * buff, size_t len, BOOL more)
 ssize_t outbytes;
 size_t left = len;
 exim_gnutls_state_st * state = ct_ctx ? ct_ctx : &state_server;
+
+/* Every use of the session below - corking, sending, uncorking - would be a use
+of a destroyed handle once the session has been closed down.  A flush of an
+empty write buffer has nothing left to do and so still succeeds; a request to
+send real data cannot be honoured and fails. */
+
+if (!state->session) return len > 0 ? -1 : 0;
 
 #ifdef SUPPORT_CORK
 if (more && !state->corked)
@@ -4514,17 +4528,21 @@ state->fd_out = newfd;
 state->tlsp = &tls_out;
 state->host = h;
 
-/* The wholesale copy above duplicated the session handle and the transfer
-buffer pointer, so two contexts would designate one session and one heap block
-and either could release them.  The session continues on the new fd under the
-outbound context, which from here on is their sole owner; drop the server
-context's references, including the water marks that index the buffer.  The
-server side does not read again on this connection - the roles have been
-reversed - and its readers all check these fields, so they now fail closed. */
+/* The copy above duplicated the inbound context's session and transfer buffer
+pointers.  Give both to the outbound context alone, since that is the context
+which gets closed down when the outbound connection finishes: were the inbound
+one left pointing at either, the same session and the same buffer could be
+released a second time.  The outbound side reads with tls_read(), into a buffer
+supplied by its caller, so it starts with the transfer state empty; the inbound
+side is left fail-closed, having nothing left to read from. */
+
+state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
+state->xfer_eof = state->xfer_error = FALSE;
 
 state_server.session = NULL;
 state_server.xfer_buffer = NULL;
 state_server.xfer_buffer_lwm = state_server.xfer_buffer_hwm = 0;
+state_server.xfer_eof = state_server.xfer_error = TRUE;
 
 tls_out = tls_in;
 tls_out.active.sock = newfd;
@@ -4546,24 +4564,29 @@ void
 tls_state_out_to_in(int newfd, const uschar * ipaddr, int port)
 {
 host_item * h = store_get_perm(sizeof(host_item), GET_UNTAINTED);
+exim_gnutls_state_st * ostate = tls_out.active.tls_ctx;
 
 memset(h, 0, sizeof(host_item));
 h->name = h->address = string_copy(ipaddr);
 h->port = port;
 
-state_server = *(exim_gnutls_state_st *)tls_out.active.tls_ctx;
+state_server = *ostate;
 state_server.fd_in = newfd;
 state_server.fd_out = newfd;
 state_server.tlsp = &tls_in;
 state_server.host = h;
+
 state_server.xfer_buffer = store_malloc(ssl_xfer_buffer_size);
 
-/* Initialise the receive state that goes with the buffer just allocated; the
-copy above brought over the outbound context's values, which do not describe
-it. */
+/* The state just copied describes the outbound connection, so start the inbound
+transfer state afresh against the buffer allocated above.  The session pointer
+was duplicated by that copy, so drop the outbound context's reference to it and
+leave the inbound context as its only owner. */
 
 state_server.xfer_buffer_lwm = state_server.xfer_buffer_hwm = 0;
 state_server.xfer_eof = state_server.xfer_error = FALSE;
+
+ostate->session = NULL;
 
 tls_in = tls_out;
 tls_in.on_connect = FALSE;
