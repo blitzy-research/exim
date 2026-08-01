@@ -80,6 +80,14 @@ JH/19 Support for DSCP, SOCKS, Proxy-Protocol and (the experimental) XCLIENT
 JH/20 Bug 3184: Disable the -bI:sieve command-line option when built without
       Sieve support.  Previously it was available but would crash.
 
+JH/21 Fix use-after-free in the GnuTLS transfer buffer.  A TLS session shut
+      down during a chunked (BDAT) body transfer released the buffer and
+      session while the readers bound to them stayed installed.  All three now
+      share one lifetime: both pointers are nulled at release, the transfer
+      state is reset, the saved chunked-body receive functions no longer refer
+      to the TLS readers, and the routines using them fail closed.  After
+      teardown the connection is reported as ended, not read on in clear.
+
 
 Exim version 4.99.1
 -------------------
