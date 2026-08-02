@@ -10,3 +10,6 @@ spool/
 test-*
 failed-summary.log
 run-summary.log
+# Locally-generated TRUSTED_CONFIG_LIST for the harness (test/README item 9).
+# Holds an absolute path to this checkout, so it must never be committed.
+trusted_configs

@@ -4586,6 +4586,14 @@ switch(error)
     if (SSL_get_shutdown(ssl) == SSL_RECEIVED_SHUTDOWN)
 	  SSL_shutdown(ssl);
 
+    /* The peer has taken the session down while we were reading it, and the
+    socket beneath it is still open.  Settle what the remains of this connection
+    are before the session goes and before the readers are pointed back at that
+    socket, as the GnuTLS backend does at the same point: smtp_tls_session_ended()
+    either retires the input, which makes the plain readers below refuse the
+    socket, or downgrades the connection explicitly. */
+
+    smtp_tls_session_ended();
     tls_close(NULL, TLS_NO_SHUTDOWN);
     return FALSE;
 
@@ -4945,6 +4953,14 @@ if (!o_ctx)		/* server side */
   state_server.u_ocsp.server.verify_stack = NULL;
 #endif
 
+  /* What becomes of the connection once the session is gone has already been
+  settled by smtp_tls_session_ended(), called from the read path before we get
+  here, exactly as in the GnuTLS backend: either the input was retired, in which
+  case the plain readers installed just below refuse the socket and report the end
+  of the input, or the connection was explicitly downgraded and they own what is
+  left of it.  Nothing about that decision is taken here, so a teardown from a
+  terminal point of the dialogue is unaffected by it. */
+
   receive_getc =	smtp_getc;
   receive_getbuf =	smtp_getbuf;
   receive_get_cache =	smtp_get_cache;
@@ -4952,6 +4968,14 @@ if (!o_ctx)		/* server side */
   receive_ungetc =	smtp_ungetc;
   receive_feof =	smtp_feof;
   receive_ferror =	smtp_ferror;
+
+  /* Resetting the vector above is not enough on its own: a chunked-body transfer
+  saves the readers it displaced and keeps dispatching through that saved vector,
+  and its pop would even reinstate them as the top-level readers.  Retire the TLS
+  readers from there too, as the GnuTLS backend does. */
+
+  bdat_invalidate_receive_functions();
+
   tls_in.active.tls_ctx = NULL;
   tls_in.sni = NULL;
   /* Leave bits, peercert, cipher, peerdn, certificate_verified set, for logging */

@@ -349,6 +349,7 @@ static uschar *smtp_inptr;
 static uschar *smtp_inend;
 static int     smtp_had_eof;
 static int     smtp_had_error;
+static BOOL    smtp_input_retired;
 
 
 /* forward declarations */
@@ -460,8 +461,143 @@ if (!(smtp_inbuffer = US malloc(IN_BUFFER_SIZE)))
   log_write_die(0, LOG_MAIN, "malloc() failed for SMTP input buffer");
 smtp_inbuffer[IN_BUFFER_SIZE-1] = '\0';
 
+/* This is where a new input source begins, and so also the one place where a
+record of a previous one having been retired is dropped. */
+
 smtp_inptr = smtp_inend = smtp_inbuffer;
 smtp_had_eof = smtp_had_error = 0;
+smtp_input_retired = FALSE;
+}
+
+
+
+/*************************************************
+*        Retire the SMTP input on this fd        *
+*************************************************/
+
+/* Called from the TLS layer, for either TLS library, when nothing further may
+be read from this connection: a TLS read failed, or the peer took the session
+down while we were part-way through taking a message.  The socket underneath the
+session is still open, but whatever arrives on it from here on is not part of the
+session the peer negotiated encryption for; reading it would silently continue
+the conversation in clear, and the transaction and authentication state built up
+under encryption would carry on with it.  So there is nothing left to read:
+record the end of this input, which both stops smtp_refill() below from going
+back to the socket - for every plain reader, since they all refill through it -
+and lets smtp_feof(), and therefore the receive_feof() that teardown installs,
+report the end of the message data to the caller that is in the middle of taking
+a message.
+
+No read error is recorded: smtp_ferror() must stay clear, because a
+peer-initiated shutdown is not an I/O failure and the message-abandoned path in
+receive_msg() keys on that.
+
+The flag lasts as long as this input does; smtp_buf_init() clears it when a
+connection starts, so a session handed over to a fresh SMTP dialogue - as ATRN
+customer mode does - is unaffected.
+
+Arguments:  none
+Returns:    nothing
+*/
+
+void
+smtp_input_retire(void)
+{
+smtp_input_retired = TRUE;
+smtp_had_eof = 1;
+
+/* Nothing buffered ahead of the plain readers is part of this input either.  The
+buffer is empty in practice - it is reset when a session starts and no plain
+refill happens while one is running - so this only keeps it consistent with the
+refusal recorded just above. */
+
+if (smtp_inbuffer) smtp_inptr = smtp_inend = smtp_inbuffer;
+}
+
+
+
+/*************************************************
+*   Settle the input after a peer TLS shutdown   *
+*************************************************/
+
+/* Called from the TLS layer of either library when the peer has taken the
+session down under a live read, before the session object and its transfer buffer
+are released and before anything is pointed back at the plain socket.  The socket
+is still open, so this is the point at which the remains of the connection have
+to be settled, one way or the other.  It is deliberately an explicit decision
+with exactly two outcomes, rather than a fall-through to the plain socket:
+
+. A shutdown arriving while a transaction is in flight - a sender or recipients
+  accepted, or a chunked body transfer running - has nothing legitimate left to
+  read.  The declared remainder of a message cannot be taken in clear on a
+  connection the peer negotiated encryption for, and a partly-read body must not
+  reach the acceptance path as though it were complete.  Retire the input: every
+  reader then refuses the socket and the caller taking the message sees the end
+  of its input.
+
+. A shutdown arriving at a command boundary is the shutdown-and-reinitialise
+  handoff that the specification describes for hosts_noproxy_tls, where a client
+  closes TLS on an open connection and the process taking over may start a fresh
+  session on it.  That continuation stays supported, but it is not a continuation
+  of the encrypted session: it is a new, unencrypted one on the same socket.  So
+  drop everything the session conferred before letting it proceed - the
+  authentication it carried and every TLS-derived attribute of the connection -
+  leaving the same state a plain connection starts with (compare the
+  initialisation in smtp_start_session()).  Otherwise a peer could shut the
+  session down and go on in clear while still presenting as authenticated and
+  encrypted, and a message taken in clear would be recorded as having arrived
+  under TLS.
+
+Arguments:  none
+Returns:    nothing
+*/
+
+void
+smtp_tls_session_ended(void)
+{
+if (sender_address || recipients_count > 0 || chunking_state >= CHUNKING_ACTIVE)
+  {
+  DEBUG(D_tls) debug_printf("TLS session ended mid-transaction: retiring input\n");
+  smtp_input_retire();
+  return;
+  }
+
+DEBUG(D_tls)
+  debug_printf("TLS session ended at a command boundary: "
+    "downgrading connection to plain, dropping session state\n");
+
+/* Authentication accepted inside the session does not survive it.  The STARTTLS
+handler below clears the first three when a session starts, and
+smtp_start_session() clears these same four when a connection starts, both for
+the same reason. */
+
+sender_host_auth_pubname = sender_host_authenticated = NULL;
+authenticated_id = NULL;
+authenticated_by = NULL;
+
+#ifndef DISABLE_TLS
+/* Nor does anything the session said about the peer or the cipher: these feed
+the ACL condition tests, the expansion variables and the log lines for whatever
+is taken next, and what is taken next arrives in clear.  tls_close() clears the
+active socket and context, and the channel binding, immediately after this. */
+
+tls_in.ver = tls_in.cipher = NULL;
+tls_in.cipher_stdname = NULL;
+tls_in.peerdn = tls_in.sni = NULL;
+tls_in.ourcert = tls_in.peercert = NULL;
+tls_in.bits = 0;
+tls_in.certificate_verified = FALSE;
+tls_in.verify_override = FALSE;
+tls_in.ext_master_secret = FALSE;
+tls_in.ocsp = OCSP_NOT_REQ;
+# ifdef SUPPORT_DANE
+tls_in.dane_verified = FALSE;
+tls_in.tlsa_usage = 0;
+# endif
+# ifndef DISABLE_TLS_RESUME
+tls_in.resumption = 0;
+# endif
+#endif
 }
 
 
@@ -494,7 +630,21 @@ int rc, save_errno;
 
 if (smtp_out_fd < 0 || smtp_in_fd < 0) return FALSE;
 
+/* Once the input has been retired the socket is not read again, whatever is
+sitting on it; see smtp_input_retire() above.  Every plain reader refills through
+here, so one test covers them all, and it comes before the flush below: there is
+nothing to send in response to input that is not going to be read, and anything
+already buffered goes out when the process finishes with the connection
+(exim_exit(), and the flushes around the SMTP loop in daemon.c).  Flushing a
+socket whose session has just gone would also risk recording a write error
+against a connection that is simply over.  Nothing else sets this, so a plain
+connection reaching its own end of file still takes the read below and reports it
+exactly as it always has. */
+
+if (smtp_input_retired) return FALSE;
+
 smtp_fflush(SFF_UNCORK);
+
 if (smtp_receive_timeout > 0) ALARM(smtp_receive_timeout);
 
 /* Limit amount read, so non-message data is not fed to DKIM.
@@ -966,26 +1116,17 @@ lwr_receive_ungetc = NULL;
 *       Remap saved lower-layer receive fns      *
 *************************************************/
 
-/* Called when the server-side TLS session is torn down, to retire the TLS
-readers from the receive path.
+/* Called from the server-side TLS teardown, so that readers a chunked-body
+transfer saved cannot outlive the session they read through.  A pushed vector is
+remapped onto the plain SMTP readers rather than cleared, because the bdat_*
+dispatch sites call through it untested, and a null lwr_receive_getc keeps its
+meaning as the "nothing pushed" state that the push and pop above key on.  That
+also makes this safe when CHUNKING was never used, safe to call more than once,
+and idempotent once the saved vector already names the plain readers.
 
-The BDAT layer displaces the receive_* function vector and keeps its own copy of
-what it displaced, dispatching through that copy for the duration of a chunked
-message body.  When the copy holds TLS readers and the session they work on is
-closed down, every further dispatch would reach into storage that has been
-released - and the pop above would promote those same readers back to being the
-primary ones.  Calling this from the TLS shutdown path keeps the saved copy from
-outliving what it refers to.
-
-The saved functions are remapped onto the plain SMTP readers - exactly what the
-teardown also installs as the top-level receive_* vector - rather than cleared:
-all four dispatch sites make an unguarded indirect call, so a cleared vector
-would leave those calls going through NULL.  Only a vector that has actually been
-pushed is touched, so a null lwr_receive_getc keeps its meaning as the "nothing
-pushed" state that the push and pop above both key on; were it populated here, a
-later push would save the bdat_* functions on top of themselves.  That also makes
-this safe to call when CHUNKING was never used, safe to call more than once, and
-idempotent when the saved vector already names the plain readers.
+What those remapped readers are then allowed to read is not settled here: the
+read path settles it, through smtp_tls_session_ended() above, before the session
+is released.
 
 Arguments:  none
 Returns:    nothing
@@ -1007,7 +1148,17 @@ int
 bdat_ungetc(int ch)
 {
 chunking_data_left++;
-bdat_push_receive_functions();  /* we're not done yet, calling push is safe, because it checks the state before pushing anything */
+
+/* We're not done yet, so the saved lower-layer vector has to be in place for
+the dispatch below.  bdat_getc() pops it as soon as a chunk runs out, so on the
+end-of-data path it has to be pushed back; on the header-reading path it is
+still pushed and there is nothing to do.  Push only in the former case: pushing
+again when it is already pushed reports a double push and would also reinstate
+the bdat_* functions as the top-level ones, undoing the reader reset that TLS
+teardown makes. */
+
+if (!lwr_receive_getc) bdat_push_receive_functions();
+
 return lwr_receive_ungetc(ch);
 }
 

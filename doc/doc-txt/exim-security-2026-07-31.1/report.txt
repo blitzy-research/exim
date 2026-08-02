@@ -48,18 +48,25 @@ Neither pointer was cleared and none of the four state fields was reset -
 xfer_buffer_lwm, xfer_buffer_hwm, xfer_eof, xfer_error (217-218, 252-254) - so
 the non-NULL test guarding the free was inert and the water marks still
 described a released buffer.  Upstream had already annotated xfer_eof as never
-set; its only reference was its own declaration.
+set, and it never was: no code assigned it.  It was read, though - through the
+shared macro (src/src/tls.c:479) by tls_feof() (528-530), the routine
+receive_feof() dispatches to once a session is up (tls-gnu.c:3359) - so the
+end-of-file channel could not report the end of the input on this backend.
 
 Two properties make this reachable rather than theoretical.  tls_refill()
 itself calls tls_close() on end of transmission (654), so the releasing agent
 and the next consumer are one call chain.  And the read path did not fail
-closed: xfer_error stayed FALSE there, only the read-timeout branch (644-649)
-setting it, so the byte reader fell through to smtp_getc() (4021-4023) and the
-teardown was invisible to its caller, which read on.
+closed: the read-timeout branch (644-649) and the genuine-error branch
+(660-666) each set xfer_error, but the zero-byte end-of-transmission branch
+(651-656) - the one that releases both objects - did not, so the byte reader
+fell through to smtp_getc() (4021-4023) and the teardown was invisible to its
+caller, which read on.
 
-There is no double free: the entry guard at 3949 tests active.sock, set to -1
-at 3990 before the free, so re-entry is short-circuited.  The residual exposure
-is dangling-pointer hygiene.
+Re-entering teardown on the same context does not release twice: the entry
+guard at 3949 tests active.sock, which 3990 sets to -1 before the free, so the
+second entry returns immediately.  On that path the residual exposure is
+dangling-pointer hygiene alone.  That bound holds for same-context re-entry
+only; the ATRN state transplant escapes it, and is the fifth unsafe path below.
 
 --------------------------------------------------------------------------------
 Unsafe Paths
@@ -74,10 +81,19 @@ Unsafe Paths
     inbytes = gnutls_record_recv(state->session, state->xfer_buffer,
       MIN(ssl_xfer_buffer_size, lim));
 
-2.  Use-after-free read, no library involved.  The buffer reader advances the
-    low-water mark by only the amount consumed, so lwm < hwm is reachable, and
-    a teardown in that window leaves the fast path at src/src/tls-gnu.c:4027
-    indexing the released block directly.
+2.  Use-after-free read, no library involved.  The one-byte push-back described
+    next does not only write into the released block; it also leaves the
+    low-water mark below the high-water mark, so the very next byte read takes
+    the buffered-data fast path and indexes the released block directly:
+
+    // src/src/tls-gnu.c:4027
+    return state->xfer_buffer[state->xfer_buffer_lwm++];
+
+    The two marks are equal at the moment of release - a refill is entered only
+    when they are equal, and the end-of-transmission branch returns before
+    assigning them - so this read follows the push-back rather than arising on
+    its own.  The buffer reader can leave the marks unequal by handing back less
+    than it holds, but not across a teardown, for the same reason.
 
 3.  One-byte use-after-free write in shared code, reached when header parsing
     pushes bytes back through the chunked-body ungetc.  The only guard was an
@@ -90,6 +106,26 @@ Unsafe Paths
 
 4.  Expired-pointer dereference: the pending-data check and the raw read entry
     point both used the destroyed session handle.
+
+5.  Two contexts naming one buffer and one session, on the ATRN state
+    transplant.  The provider direction, which turns the inbound context into
+    the outbound one, copied the whole server context - buffer pointer and
+    session handle with it - allocated no replacement, and left the server
+    context still naming both:
+
+    // src/src/tls-gnu.c:4414
+    *state = state_server;
+
+    The customer direction (4446) duplicated the session handle the same way,
+    allocating a fresh buffer (4451) but not detaching the outbound context
+    from the session.  Whichever of the two contexts was closed first released
+    objects the other still named, and what stops same-context re-entry does
+    not stop this: each direction zeroes the support block it moved out of
+    (4425 and 4458), a zeroed active.sock is 0, and the test at 3949 admits
+    anything that is not negative.  A second release of the same buffer was
+    reachable here.  That test has to stay "not negative" rather than "not
+    zero", because both transplant callers legitimately pass descriptor 0
+    (src/src/atrn.c:59 and :139).
 
 The DKIM verification feed sits on this same path (src/src/tls-gnu.c:668), so
 the released buffer was also the one offered to signature verification.
@@ -132,8 +168,11 @@ win and no prior information leak is needed.  The attacker controls both the
 moment of teardown and the content then decoded into the released allocation.
 The daemon forks one process per accepted connection, so this is
 pre-authentication remote heap corruption in a process parsing untrusted input.
-Client-side contexts are unaffected: the client path never allocates a transfer
-buffer (3619-3620), so every client context holds a NULL one.
+A context an outbound delivery makes for itself is unaffected:
+tls_client_start() (3619-3620) never allocates a transfer buffer, so such a
+context holds a NULL one and none of the above reaches it.  The exception is the
+outbound context the ATRN transplant builds by copying the server's, which does
+name the server's buffer and session; that is the fifth unsafe path above.
 
 ================================================================================
 AFFECTED VERSIONS
@@ -141,11 +180,12 @@ AFFECTED VERSIONS
 
 Present in the 4.100 development tree and, on the evidence of the project's own
 release record, in all preceding releases that shipped the GnuTLS backend with
-CHUNKING support.  The basis is that doc/doc-txt/ChangeLog holds no entry
-anywhere referencing the transfer buffer, tls_close() or gnutls_record_recv(),
-its only mention of tls-gnu.c at all being an unrelated DH_BITS change from a
-much earlier era: the allocate-and-free asymmetry between the two TLS backends
-is long-standing, not a recent regression.
+CHUNKING support.  The basis is that before the entry recording this fix,
+doc/doc-txt/ChangeLog held no entry referencing the transfer buffer, tls_close()
+or gnutls_record_recv(), its only mention of tls-gnu.c at all being an unrelated
+DH_BITS change from a much earlier era: the allocate-and-free asymmetry between
+the two TLS backends is long-standing, not a recent regression.  The entry
+recording this fix is now the first such reference.
 
 The exact earliest affected release cannot be established without access to
 external project history, which was not available when this report was written.
@@ -183,9 +223,15 @@ On the OpenSSL backend the buffer use-after-free does not arise, that backend
 never releasing its transfer buffer.  Its equivalent stale-reader path instead
 reaches a read call with a NULL session - a NULL-pointer dereference, so a
 crash of the one forked per-connection process rather than heap corruption.
-The remediation below closes that path too, the reader-vector correction living
-in shared chunked-body code; that is a consequence of this fix, and the OpenSSL
-backend itself was not modified.
+The remediation below closes that path too, and the parts of it that do so are
+shared: the teardown decision is taken in the chunked-body layer, and the gate
+that holds a retired input closed sits in the refill the plain readers go
+through, so it governs the byte reader and the buffer reader alike whichever
+backend installed them.  The OpenSSL backend is edited only to reach those
+shared parts - the decision is called from the end-of-transmission branch of
+that backend's refill, and the saved reader vector is invalidated at its
+teardown - its own readers being left as they were.  Closing that backend's
+exposure is a consequence of this fix rather than its subject.
 
 Any severity characterisation here is a code-derived assessment, not verified
 against NVD, MITRE or any vendor advisory.
@@ -202,9 +248,14 @@ residual path can act on a released object.
 -   At release the owning pointers are cleared - the session pointer
     immediately after gnutls_deinit(), the transfer-buffer pointer immediately
     after store_free() - the water marks are zeroed, and the end-of-file and
-    error latches are set, so the read path fails closed rather than reverting
-    to the plain socket.  This also gives xfer_eof, which nothing had ever set,
-    a value.
+    error latches are set.  All of that is unconditional, for every teardown of
+    a server session, so a reader that still reaches this state finds it
+    finished rather than half-described, whatever the dialogue was doing at the
+    time.  It also gives xfer_eof a value, which nothing had ever done - the
+    routine that reads it could until now only ever report this input as
+    unfinished.  What makes the end of the input observable after a teardown is
+    not that flag, though: teardown points the end-of-file check at the plain
+    reader's own record, which the retirement described below sets.
 
 -   Before the buffer is released, the saved lower-layer reader vector no
     longer refers to the TLS readers.  It is re-pointed at the plain readers -
@@ -214,13 +265,35 @@ residual path can act on a released object.
     dispatch a TLS reader: not directly, not by promotion back to primary, and
     not by a re-pop on a later message.
 
--   The input carried by the closed session is recorded as ended, so the plain
-    readers the teardown reinstates do not read that socket again, and the end
-    of the input becomes observable through the feof channel.
+-   What becomes of the socket is settled on the read path, before the session
+    is released and before anything is pointed back at that socket, and it has
+    exactly two outcomes.  If a transaction is in progress - a sender or
+    recipients already accepted, or a chunked body being received - the input is
+    retired: it is recorded as ended, anything buffered for it is discarded, the
+    refill both plain readers go through refuses to read the socket again, and
+    the end of the input becomes observable through the feof channel.  The
+    message in progress therefore fails and no further command is taken from
+    that connection.
 
--   Both allocation sites initialise the transfer state for the session they
-    start, so a legitimate second TLS session on one TCP connection is
-    unaffected by the latches set at the previous teardown.
+-   Otherwise the peer ended the session between commands.  That is a handoff
+    this server documents and performs itself, so the connection does continue
+    in clear - but as an explicit downgrade, and as a plain connection and
+    nothing more.  Every piece of state the ended session conferred is dropped
+    with it: the authenticated sender and identity established under it, and the
+    whole recorded TLS status.  STARTTLS is offered again, as on any plain
+    connection.
+
+-   The latches cannot be inherited.  Both of the sites that allocate a transfer
+    buffer initialise the transfer state for the session they are starting - the
+    server handshake and the state transplant an ATRN customer child takes over
+    - so no later session begins life holding an earlier teardown's end-of-file
+    or error.  The server context is not re-zeroed between successive TLS
+    sessions on one TCP connection, and its stale water marks were already being
+    inherited into a fresh buffer before this change, so these resets are part
+    of the fix rather than optional hardening.  Teardown likewise clears
+    the flag recording that peer details have been taken: without that, a second
+    session on one connection inherited the first one's reported version, cipher
+    and certificate status instead of computing its own.
 
 -   The consumers - refill, the byte and buffer readers, the cached-data feed,
     the pending-data check, and the read and write entry points - test for a
@@ -229,12 +302,17 @@ residual path can act on a released object.
     data, or an error.  The one-byte write in shared code is guarded the same
     way, in a form correct for both TLS backends.
 
--   The ATRN state-transplant paths no longer leave two contexts holding the
-    same session and buffer, so neither can release what the other owns.
+-   The ATRN state-transplant paths no longer leave two contexts naming the
+    same session and buffer.  Each hands sole ownership to the context that
+    will go on to close it and drops the other's reference, so the second
+    release described in the fifth unsafe path cannot happen; the descriptor
+    test stays "not negative", so a transplant onto descriptor 0 keeps working.
 
 Changes are confined to the TLS transfer-buffer lifetime logic and the
-chunked-body handling: src/src/tls-gnu.c, src/src/tls.c, src/src/smtp_in.c, and
-one added declaration in src/src/functions.h.  What does not change: no public
+chunked-body handling: src/src/tls-gnu.c, src/src/tls.c, src/src/smtp_in.c,
+three added declarations in src/src/functions.h, and in src/src/tls-openssl.c
+the two calls by which that backend reaches the shared teardown decision and
+the shared reader reset.  What does not change: no public
 API and no ABI; no change to the SMTP protocol on the wire; no change to the
 spool file format; no new configuration option and no change to any existing
 option or default value; no change to the chunking state machine or any of its
@@ -255,12 +333,14 @@ and <https://wiki.exim.org/SecurityReleaseProcess>.
 Behavioural Change
 --------------------------------------------------------------------------------
 
-One behaviour changes deliberately, and is disclosed here rather than left to
-be discovered.  A peer that tears down TLS mid-chunk while holding the TCP
-socket open previously had its subsequent traffic read in clear on that socket,
-as though it were a continuation of the encrypted session.  The read path now
-fails closed instead: that traffic is not read, and no further SMTP command is
-accepted on the connection.
+Two behaviours change deliberately, and both are disclosed here rather than
+left to be discovered.
+
+The first.  A peer that tears down TLS in the middle of a transaction while
+holding the TCP socket open previously had its subsequent traffic read in clear
+on that socket, as though it were a continuation of the encrypted session.  The
+read path now fails closed instead: that traffic is not read, the message in
+progress fails, and no further SMTP command is accepted on the connection.
 
 This is correct hardening, not breakage - reading a socket in clear after the
 negotiated session has been destroyed voids the confidentiality guarantee the
@@ -269,27 +349,118 @@ memory.  For precision: the server still emits a terminal failure response
 before closing, and because the session is already gone that response goes out
 in clear.  The claim is about the read path, and about no further command being
 accepted - not that nothing whatever is transmitted after teardown.
-Well-behaved clients never traverse this path, so the reach of the change is
-bounded.
+
+Peers that do not shut a session down while intending to carry on reading the
+socket reach none of this.  In particular the handoff Exim's own SMTP transport
+performs for a host matched by hosts_noproxy_tls - shutting the TLS session down
+and sending a fresh EHLO in clear on the same socket, to learn whether the
+socket may be passed to the next delivery process - happens between messages,
+not during one, so it is not this case; it is the second one below, and it keeps
+working.
+The regression suite holds the fix to that: tests 1157, 3451 and 3461 take
+several messages over one connection with the session ended between them, and
+they pass against their unchanged saved references.
+
+The second.  A peer that ends the session cleanly between commands is a
+different case and is treated differently, because that is a handoff this
+server documents and performs itself when it passes a connection to another
+process.  Such a connection still continues in clear - but now as a plain
+connection and nothing more.  Previously the recorded session outlived its own
+destruction: a sender authenticated under TLS, the identity that authentication
+established, and the whole reported TLS status - version, cipher, certificate
+verification result - stayed attached to the connection and were applied to,
+and logged for, messages accepted in clear afterwards.  That state is now
+dropped when the session ends, and STARTTLS is offered again.  A peer that
+relied, knowingly or not, on authentication or TLS status carrying across a
+session teardown must authenticate again, or negotiate again, on what is left
+of the connection.
 
 --------------------------------------------------------------------------------
 Verification
 --------------------------------------------------------------------------------
 
-The remediation is verified by a sanitizer-instrumented build driven by a
-reproducer combining a partial BDAT chunk with a TLS shutdown, together with
-the project's regression suite.  The negative control is mandatory and its
-order matters: the reproducer must be shown to fail on the unremediated tree
-first, and to pass only after the fix is applied.  One that passes in both
-states is a defective test, not evidence of a fix.  The pass criterion is the
-absence of any sanitizer report, not merely the absence of a crash, since an
-uninstrumented build can survive a use-after-free write silently.
+Remediation is checked two ways: with a sanitizer-instrumented build driven by a
+reproducer combining a partial BDAT chunk with a TLS shutdown, and with the
+project's regression suite.  The negative control is mandatory and its order
+matters: the reproducer must be shown to fail on the unremediated tree first,
+and to pass only after the fix is applied.  One that passes in both states is a
+defective test, not evidence of a fix.  The pass criterion is the absence of any
+sanitizer report, not merely the absence of a crash, since an uninstrumented
+build can survive a use-after-free write silently.
+
+Two of the unsafe paths above are directly observable this way, and both were
+observed.  On the unremediated tree the reproducer yields a heap-use-after-free
+WRITE of size 1 in tls_ungetc at src/src/tls.c:510, and a heap-use-after-free
+READ of size 1 in tls_getc at src/src/tls-gnu.c:4027 - both into the same
+released allocation, both reports naming its release in tls_close
+(src/src/tls-gnu.c:3996, reached from tls_refill at :654) and its allocation in
+tls_server_start (:3279).  Because the read becomes reachable only after the
+write has moved the low-water mark, the sanitizer has to be built and run so
+that it continues past the first report; stopping at the first one hides the
+second.  After the fix neither report appears, and the connection ends rather
+than the partial body being accepted.
+
+One limitation belongs here rather than being left unsaid.  The first of the
+unsafe paths - the up-to-4096-byte store GnuTLS itself performs into the
+released buffer - is not visible to the sanitizer.  The allocation written into
+is Exim's, but the write is executed inside the library, which is not
+instrumented.  That path is closed by the same change, and is argued from the
+code rather than from a sanitizer report; no report should be claimed for it.
+The other two paths above - the expired session handle, and the second release
+on the ATRN transplant - are not what this reproducer drives, and are argued
+from the code in the same way; no sanitizer report is claimed for them either.
+
+What that produced.  Under the sanitizer, the unremediated tree reported
+heap-use-after-free for both variants driven at it: the one-byte write through
+the shared unget path, and the direct read of the released buffer.  On the
+remediated tree, built from the sources this report describes, both variants run
+to completion with no sanitizer report of any kind, the connection ending in a
+terminal failure response instead.
+
+The reproducer added to the suite behaves the same way round.  It fails on the
+unremediated tree - both on the tree this work started from and on an
+intermediate one that latched the transfer state only conditionally - and passes
+on the remediated tree.  No run of it emits either the chunked-body double-push
+or the double-pop diagnostic; nor does any other run made for this work.
+
+The regression witnesses behave as they did before the change: chunked reception
+and transmission, chunked transfers under TLS, the state-transplant paths, the
+interaction with message signature verification both with and without TLS, early
+pipelining and per-recipient data all pass, apart from a few that already failed
+on the unremediated tree for reasons unrelated to this defect and fail
+identically after it.  The whole automatic range of the suite was then run on
+both trees and the failing sets compared: the set that fails consistently is the
+same on each, and the remediated tree introduces no failure of its own.  The
+GnuTLS category the reproducer joins passes in full.  The other backend's own
+category, and the shared TLS category, were run from a build of that backend and
+are unchanged between the two trees as well.
+
+One caveat for anyone reproducing this.  A handful of tests in the suite turn on
+wall-clock spacing, on kernel fast-open state, or on generated file names, and
+so pass or fail according to how loaded the machine is rather than according to
+what the code does.  Each full run turned up one or two of them, and never the
+same ones - the run on the unremediated tree had its own - which is why the
+comparison above rests on repeated runs and on the set that fails consistently,
+and not on any single run.
 
 Regression runs drive the harness non-interactively and never rewrite its saved
 reference files, the option that would rewrite them being excluded precisely
-because it would mask the regression the run exists to detect:
+because it would mask the regression the run exists to detect.  The binary
+handed to the harness is used at both ends of each scenario, so a scenario that
+has to be served by one particular TLS backend is run by handing the harness a
+build of that backend and passing no backend-selecting option: that option is
+for cross-library testing and puts the other build on the server side, which
+would leave such a scenario served by the wrong one.
 
-    ./runtest <binary> --continue --tls gnutls <tests>
+    cd test
+    ./runtest ../src/build-Linux-x86_64/exim --continue --range 2000 2099
+
+The binary given there is the one that serves the connection, so it also decides
+which backend is under test: a GnuTLS test has to be run with a GnuTLS build.
+
+Sanitizer runs are driven outside the harness and against a build that is not
+installed setuid, the harness installing a setuid copy of the binary and that
+not coexisting with the sanitizer.
 
 ================================================================================
 STATUS AND IDENTIFIERS
@@ -304,11 +475,6 @@ this one.
 
 Following this project's own convention, this advisory directory is named for
 the date the defect was raised; an alias may be added later if and when an
-identifier is assigned.  The authoritative schedule is the timeline file
-alongside this report:
-
-    2026-07-31   identified by code inspection; remediation prepared
-    2026-08-04   planned: publish the fix via the distros repository, for
-                 the distribution packagers
-    2026-08-07   planned: publish the fix via the default repository, for
-                 the public
+identifier is assigned.  The announcement prepared for the public disclosure is
+kept alongside this report as oss-security.txt, and the disclosure chronology,
+including the publication schedule, is recorded in the timeline file beside it.

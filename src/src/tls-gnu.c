@@ -214,7 +214,7 @@ typedef struct exim_gnutls_state {
   BOOL			peer_dane_verified:1;
   BOOL			trigger_sni_changes:1;
   BOOL			have_set_peerdn:1;
-  BOOL			xfer_eof:1;	/*XXX never gets set! */
+  BOOL			xfer_eof:1;
   BOOL			xfer_error:1;
 #ifdef SUPPORT_CORK
   BOOL			corked:1;
@@ -618,12 +618,14 @@ which also nulls both pointers.  Note that we can be re-entered after that has
 happened: tls_close() is called from the end-of-transmission branch below, so
 the agent that releases the buffer and the consumer that would next read into
 it are the same call chain.  Fail closed rather than hand released memory to
-the library; the error latch makes our callers stop reading. */
+the library, and retire the input so that the plain readers do not take up the
+socket in its place. */
 
 if (!state->session || !state->xfer_buffer)
   {
   DEBUG(D_tls) debug_printf("TLS read after session teardown\n");
   state->xfer_error = TRUE;
+  smtp_input_retire();
   return FALSE;
   }
 
@@ -651,20 +653,29 @@ if (had_data_timeout)
 if (had_data_sigint)
   smtp_data_sigint_exit();
 
-/* Timeouts do not get this far.  A zero-byte return appears to mean that the
-TLS session has been closed down, not that the socket itself has been closed
-down. Revert to non-TLS handling. */
+/* Timeouts do not get this far.  A zero-byte return means the TLS session has
+ended even if the socket remains open; tear down, and settle what is left of the
+connection before anything reads it again. */
 
 if (sigalrm_seen)
   {
   DEBUG(D_tls) debug_printf("Got tls read timeout\n");
   state->xfer_error = TRUE;
+  smtp_input_retire();
   return FALSE;
   }
 
 else if (inbytes == 0)
   {
   DEBUG(D_tls) debug_printf("Got TLS_EOF\n");
+
+  /* The peer has taken the session down while we were reading it, and the socket
+  beneath it is still open.  Settle what the remains of this connection are
+  before the session goes and before the readers are pointed back at that
+  socket; smtp_tls_session_ended() either retires the input or downgrades the
+  connection explicitly, and every reader from here on answers accordingly. */
+
+  smtp_tls_session_ended();
   tls_close(NULL, TLS_NO_SHUTDOWN);
   return FALSE;
   }
@@ -676,6 +687,7 @@ else if (inbytes < 0)
   DEBUG(D_tls) debug_printf("%s: err from gnutls_record_recv\n", __FUNCTION__);
   record_io_error(state, (int) inbytes, US"recv", NULL);
   state->xfer_error = TRUE;
+  smtp_input_retire();
   return FALSE;
   }
 #ifndef DISABLE_DKIM
@@ -4006,6 +4018,14 @@ if (do_shutdown && state->session)
 
 if (!ct_ctx)	/* server */
   {
+  /* What becomes of the connection once the session is gone has already been
+  settled by smtp_tls_session_ended(), called from the read path before we get
+  here: either the input was retired, in which case the plain readers installed
+  just below refuse the socket and report the end of the input, or the connection
+  was explicitly downgraded and they own what is left of it.  Nothing about that
+  decision is taken here, so a teardown from a terminal point of the dialogue -
+  QUIT, a rejected connection, a failed STARTTLS - is unaffected by it. */
+
   receive_getc =	smtp_getc;
   receive_getbuf =	smtp_getbuf;
   receive_get_cache =	smtp_get_cache;
@@ -4014,13 +4034,10 @@ if (!ct_ctx)	/* server */
   receive_feof =	smtp_feof;
   receive_ferror =	smtp_ferror;
 
-  /* Resetting the vector above is not enough on its own: a chunked-body
-  transfer saves the readers it displaced and keeps dispatching through that
-  saved vector, and its pop would even reinstate them as the top-level readers.
-  Retire the TLS readers from there too, before the buffer they are bound to is
-  released below.  The helper remaps that saved vector onto the plain-socket
-  readers rather than clearing it, because the chunked-body dispatch sites call
-  through it without testing it first. */
+  /* Retire the saved BDAT readers too, before the session and the transfer
+  buffer they read through are freed: the chunked path dispatches through its own
+  saved copy of the vector, and its pop would even reinstate those readers as the
+  top-level ones. */
 
   bdat_invalidate_receive_functions();
   }
@@ -4030,6 +4047,16 @@ if (state->session)
   gnutls_deinit(state->session);
   state->session = NULL;
   }
+
+/* The peer status was computed once for the session that has just gone, and the
+server context that holds the record of that is reused for a later session on the
+same connection.  Drop the record, so that a later session computes its own
+cipher, version and peer certificate rather than presenting this session's as
+though they were its own.  What has already been reported for this session is
+untouched: the reported values were copied out, not aliased. */
+
+state->have_set_peerdn = FALSE;
+
 tlsp->active.sock = -1;
 tlsp->active.tls_ctx = NULL;
 /* Leave bits, peercert, cipher, peerdn, certificate_verified set, for logging */
@@ -4045,34 +4072,20 @@ fast paths from indexing a buffer that is no longer there. */
 state->xfer_buffer = NULL;
 state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
 
-/* A shutdown part-way through taking a message must not let the rest of that
-message go on being read: latch the error, so that the read routines report the
-end of their input rather than taking the remainder from the plain socket, in
-clear, on a connection the peer negotiated encryption for.  The end-of-file flag
-is latched with it; nothing has ever set that flag, which left tls_feof() unable
-to report the end of this input at all.  A later handshake on this same
-connection is unaffected, because both allocation sites clear the pair for the
-session they start.
+/* This input is finished, whatever point of the conversation the shutdown
+arrived at: latch both flags.  The end-of-file flag is read by tls_feof(), which
+without it can only ever report this input as unfinished.  Latching the error
+flag leaves a stale TLS reader with an unmistakably finished input.
 
-A chunked body transfer in progress is the obvious case but not the only one: a
-chunk that has just been completed leaves the chunking state back at merely
-offered while the transaction it belongs to is still open, and the next chunk of
-that same message must not be allowed to arrive in clear either.  An open
-transaction is therefore latched on as well.
+Neither flag is what makes the end of the input observable after a server
+teardown: the vector reset above has already pointed the end-of-file check at
+smtp_feof(), which reports the plain reader's own record, and what may still be
+read from the socket underneath is not decided here at all -
+smtp_tls_session_ended() settles that on the read path, before this runs.  A
+later handshake on this same connection is unaffected, because both allocation
+sites clear the pair for the session they start. */
 
-What stays deliberately outside the latch is a shutdown at a command boundary
-with no message in hand.  A peer may shut the session down between messages and
-carry on with a fresh EHLO in clear - that is how an open connection is handed on
-between delivery processes - and the start of message handling resets the
-transaction before any command is read, so the tests below are false there and
-the plain handling remains available.  Failing that closed would break ordinary
-delivery rather than any attack. */
-
-if (  chunking_state > CHUNKING_OFFERED
-   || sender_address			/* transaction in progress */
-   || recipients_count > 0
-   )
-  state->xfer_eof = state->xfer_error = TRUE;
+state->xfer_eof = state->xfer_error = TRUE;
 }
 
 
@@ -4104,16 +4117,18 @@ clear as if it were a continuation of the encrypted session. */
 
 if (!state->session || !state->xfer_buffer) return EOF;
 
-/* A failed refill that recorded an error - a read timeout, a library failure, or
-a teardown while a message was being taken - is the end of this input: answer
-end-of-file rather than reading the remainder of that message in clear from the
-plain socket.  A teardown at a command boundary with no message in hand records
-no error, and there the plain reader is the correct continuation, as it has
-always been. */
+/* A refill that failed - a read timeout, a library failure, or the peer taking
+the session down - is the end of what this reader owns, so hand the read on to
+the reader that owns whatever is left of the connection.  That is never a
+transparent continuation of the encrypted session: tls_refill() has already
+retired the input for every failure and for a shutdown taken mid-transaction, and
+a retired input is refused by the plain reader, so this answers end-of-file in
+all of those cases.  It reads the socket only where the read path decided the
+connection was explicitly downgraded to plain. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(lim))
-    return state->xfer_error ? EOF : smtp_getc(lim);
+    return smtp_getc(lim);
 
 /* Something in the buffer; return next uschar */
 
@@ -4143,17 +4158,14 @@ if (!state->session || !state->xfer_buffer)
   return NULL;
   }
 
-/* As in tls_getc() above: a refill that failed with an error recorded is the end
-of this input, while one that did not is a teardown at a command boundary with no
-message in hand, where the plain reader is the correct continuation. */
+/* As in tls_getc() above: a failed refill ends what this reader owns, and the
+read is handed to the reader that owns the rest of the connection - which refuses
+a retired input, so this reports nothing available for every failure and for a
+shutdown taken mid-transaction. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(*len))
-    {
-    if (!state->xfer_error) return smtp_getbuf(len);
-    *len = 0;
-    return NULL;
-    }
+    return smtp_getbuf(len);
 
 if ((size = state->xfer_buffer_hwm - state->xfer_buffer_lwm) > *len)
   size = *len;

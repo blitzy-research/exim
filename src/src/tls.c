@@ -504,16 +504,8 @@ Returns:       the character
 int
 tls_ungetc(int ch)
 {
-/* The transfer buffer may already have been released, by a TLS teardown that
-happened while a chunked body transfer was still in progress.  The pointer is
-nulled when the buffer is freed, so testing it here is what stops a reader that
-outlived the session from writing into memory that has been handed back.  That
-is an expected state after a shutdown rather than a programming error, so
-decline the write quietly and report the character as the interface promises.
-
-Keep this test ahead of the underflow check below: the water marks are reset
-along with the buffer, so an ordinary teardown would otherwise be reported as
-an underflow and take the process down with it. */
+/* A teardown that releases the buffer nulls it and resets the water marks, so
+check the pointer before the underflow test: a stale ungetc fails quietly. */
 
 if (!ssl_xfer_buffer) return ch;
 

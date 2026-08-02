@@ -85,8 +85,17 @@ JH/21 Fix use-after-free in the GnuTLS transfer buffer.  A TLS session shut
       session while the readers bound to them stayed installed.  All three now
       share one lifetime: both pointers are nulled at release, the transfer
       state is reset, the saved chunked-body receive functions no longer refer
-      to the TLS readers, and the routines using them fail closed.  After
-      teardown the connection is reported as ended, not read on in clear.
+      to the TLS readers, and the routines using them fail closed.  Peer
+      teardown is now decided on the read path before the session is
+      released: during a transaction the input is ended, so the message fails
+      and the connection is not read on; at a command boundary the connection
+      carries on as a plain one, dropping the authentication and the TLS
+      status that the ended session conferred.  One consequence for
+      Exim-to-Exim delivery: the smtp transport hands an open connection to
+      the next delivery process by shutting TLS down and trying a cleartext
+      EHLO on the same socket.  That handoff still works, but the connection
+      it hands over is a plain one, so a message taken on it is no longer
+      recorded as having arrived under TLS.
 
 
 Exim version 4.99.1
