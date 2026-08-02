@@ -27,26 +27,30 @@ cannot narrow further. OpenSSL builds are affected differently and far less
 severely; no OpenSSL backend source is edited here.
 
 Remediation is prepared. Buffer, session handle and the callbacks operating on
-both are given a single, jointly enforced lifetime, and what a server session
-records - the peer's server name, its certificate, DN and cipher suite, the
-verification results and the channel-binding type - is cleared where each
-session starts, so a later session on the same connection cannot report it.
-The change is confined to the GnuTLS transfer-buffer lifetime logic and the
-chunked-body handling. No public API or ABI, SMTP wire protocol, spool format,
+both are given a single, jointly enforced lifetime. What a server session
+records in its own context - the server name the peer sent, the peer's
+certificate and ours, the peer DN, the cipher-suite string, the verification
+results and the channel-binding type - is cleared as each session's state is
+set up and before its handshake; the two certificates are library objects that
+context owns, and are released there, exactly once each. What a finished
+session reported stays readable until the next one begins, the expansion
+variables and the logging of an accepted message depending on that. The change
+is confined to the TLS transfer-buffer lifetime logic and the chunked-body
+handling. No public API or ABI, SMTP wire protocol, spool format,
 configuration option or default, or chunking_state_t transition changes.
 
-Two changes are visible to operators. A session ended during a transaction, a
-body transfer, an authentication exchange or a part-read command line now
-fails closed - nothing further is read and the message in progress fails -
-though a terminal 421 still goes out, in clear, before the close. A session
-ended cleanly between commands still lets the connection continue, but as a
-plain one: the authentication, every field of the reported TLS status, the
-greeting state and the connection-scope ACL variables all go with the session,
-a fresh HELO/EHLO is required, and until STARTTLS succeeds again the socket
-answers only HELO/EHLO, STARTTLS, NOOP and QUIT, refusing every other command
-with the 530 of RFC 3207 ahead of the handlers, so nothing is begun and no ACL
-runs. A successful STARTTLS restores the connection, so the smtp transport's
-handoff of an open connection still works.
+Two changes are visible to operators. A server session that ends now ends the
+input on its connection: nothing further is read from that socket in clear and
+a message in progress fails, wherever the session ended - in a transaction, a
+body transfer, an authentication exchange, a part-read command line, between
+commands - though a terminal 421 still goes out, in clear, before the close. A
+connection on which no session ever came up is left alone, so a handshake that
+failed is answered as before. And a peer that ends a session meaning to go on
+using the socket is answered with end of file: the smtp transport's
+hosts_noproxy_tls handoff is such a peer, so its next message is delivered on a
+connection of its own rather than a handed-on one - none is lost, deferred or
+duplicated, and what changes is the re-use, visible in a log as a connection
+per message.
 
 One workaround exists, as a compensating control rather than a fix:
 restricting chunking_advertise_hosts so CHUNKING is not advertised removes the

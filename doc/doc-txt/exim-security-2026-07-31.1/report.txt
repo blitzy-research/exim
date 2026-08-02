@@ -91,9 +91,12 @@ code-derived, not verified against NVD, MITRE or any vendor advisory.
 The OpenSSL backend is affected differently: the buffer use-after-free does not
 arise there, that backend never releasing its transfer buffer; its equivalent
 stale-reader path instead reaches a read call with a NULL session - CWE-476, a
-crash of one forked process rather than heap corruption. No OpenSSL backend
-source is modified here, though that lesser exposure is closed as a side
-effect, the reader-vector correction being in shared chunked-body code.
+crash of one forked process rather than heap corruption. What it does share is
+the reading on in clear: its byte reader has the same fall-through, on the same
+condition. No OpenSSL backend source is modified here. Both of those are
+nonetheless closed, because the two corrections that close them - re-pointing
+the saved reader vector, and deciding that nothing further is read - are made
+in code the two backends share rather than in either of them.
 
 ================================================================================
 REMEDIATION
@@ -108,50 +111,48 @@ jointly enforced lifetime.
     and both sites that allocate a buffer initialise that state, so no later
     session inherits it.
 
--   Everything else a server session owns is dropped where each session starts,
-    immediately before its handshake, that being the one point every server
-    session passes through: the server name the peer sent and whether it drives
-    file expansion, the peer certificate, its DN and the cipher suite, the two
-    verification results, the channel-binding type and the
-    extended-master-secret record. Only the credential cache is kept, that
-    being what makes it a cache.
+-   What a server session records is dropped where each session starts, as its
+    own state is set up and before its handshake, that being the one point
+    every server session passes through: the server name the peer sent and
+    whether it drives file expansion, the peer's certificate and ours, the peer
+    DN and the session's cipher-suite string, the two verification results, the
+    channel-binding type and the extended-master-secret record. The two
+    certificates are library objects that context owns, and are released there
+    rather than merely dropped, exactly once each. Only the credential cache is
+    kept, that being what makes it a cache. What a finished session reported
+    stays readable until the next one begins, the expansion variables and the
+    logging of an accepted message depending on that.
 
 -   The saved lower-layer reader vector no longer refers to the TLS readers
     once the buffer is released: it is re-pointed at the plain readers, and
     only where a vector was actually pushed, so the "nothing pushed" sentinel
-    that push and pop key on keeps its meaning. No path can dispatch a TLS
-    reader afterwards.
+    that push and pop key on keeps its meaning. The four chunked-body dispatch
+    sites settle it the same way before they use it, as does the pop that writes
+    a saved reader back as a top-level one - neither depending on which backend
+    tore the session down. No path installs or dispatches a TLS reader
+    afterwards, on either backend.
 
--   What becomes of the socket is settled once, at teardown, after the readers
-    have been re-pointed and before the objects are released. Unless the
-    session ended while the server was waiting for a fresh command with nothing
-    in flight, the input is retired - recorded as ended and not read again, so
-    the message fails and no further command is taken. That covers a
-    transaction, a body transfer, an authentication exchange, a part-read
-    command line, and every teardown the server initiates itself.
-
-    Only a session ended between commands leaves the connection continuing, and
-    then as an explicit downgrade and nothing more: the authentication, every
-    field of the recorded TLS status, the greeting state and the
-    connection-scope ACL variables holding decisions taken under the session
-    all go with it, so a fresh HELO/EHLO is required. While the teardown stands
-    recorded the socket answers only what RFC 3207 section 4 leaves a server
-    requiring TLS able to answer - HELO/EHLO, STARTTLS, NOOP and QUIT -
-    refusing every other command with the 530 that section prescribes, decided
-    once ahead of the command handlers, so a refused command starts no
-    transaction, counts towards no per-message limit, runs no ACL and cannot
-    act on what the session conferred; it counts as a protocol error, so a peer
-    that persists is disconnected. A successful STARTTLS clears the record and
-    the peer resumes under a new session; a failed one leaves it set.
+-   The input on the connection is ended at teardown, after the readers have
+    been re-pointed and before the objects are released: it is recorded as
+    ended and not read again, so a message in progress fails and no further
+    command is taken. That holds wherever the session ended - in a transaction,
+    a body transfer, an authentication exchange, a part-read command line,
+    between commands - and for every teardown the server initiates itself. It
+    is decided in the one refill every plain reader passes through as well, so
+    a backend whose own teardown does not reach that point cannot read on
+    either. A connection on which no session ever came up is left alone: a
+    handshake that failed is answered as before, which matters because a
+    handshake can fail late enough to have recorded a cipher suite, and because
+    the server answers a failed one by reading on in clear to refuse until the
+    peer gives up.
 
 -   Every consumer of the buffer or the session tests for release before use
-    and answers from that test, and a reader finding its session gone falls
-    back to the plain socket only where the teardown decision was that
-    downgrade. The one-byte write in shared code is guarded the same way, in a
-    form correct for both backends, and the transplant paths hand sole
-    ownership to the context that will close it. A session ending before its
-    handshake completes is reported as a handshake failure, and its buffer and
-    session released there.
+    and answers from that test: a reader that finds its session gone reports
+    end of file, and does not fall back to the socket underneath. The one-byte
+    write in shared code is guarded the same way, in a form correct for both
+    backends, and the transplant paths hand sole ownership to the context that
+    will close it. A session ending before its handshake completes is reported
+    as a handshake failure, and its buffer and session released there.
 
 Changes are confined to the TLS transfer-buffer lifetime logic and the
 chunked-body handling: src/src/tls-gnu.c, src/src/tls.c, src/src/smtp_in.c, and
@@ -173,11 +174,20 @@ Behavioural Change
 
 Two consequences are worth stating plainly. A terminal 421 reporting the lost
 connection still goes out, in clear, before the close: what is guaranteed is
-about the read path, not that nothing at all is transmitted after teardown. And
-a peer that relied on its authentication or reported TLS status outliving the
-session, or on handing a message over in clear after a teardown, must negotiate
-again - which is what the hosts_noproxy_tls handoff does, so it completes as
-before and the delivery following it is again made under TLS.
+about the read path, not that nothing at all is transmitted after teardown.
+
+And a peer that ends a session meaning to go on using the socket is answered
+with end of file. The smtp transport's hosts_noproxy_tls handoff is such a
+peer: it shuts the session down and offers a fresh greeting in clear so that an
+open connection can be handed to the next delivery, and that greeting is no
+longer answered, so the connection is not handed on and the next message is
+delivered on one of its own. No message is lost, deferred or duplicated by
+that: what was delivered on the connection is logged as delivered, and what
+remains is delivered afterwards. What changes is the re-use, and it shows in a
+log as a connection per message - the marker recording a delivery made over a
+handed-on connection is gone, the session-start sequence where that is logged
+opens with a greeting of its own instead of resuming, and the receiving side
+records the connection whose session ended as lost rather than closed by QUIT.
 
 --------------------------------------------------------------------------------
 Verification
@@ -208,41 +218,45 @@ the second release on the transplant path, which the reproducer does not drive.
 All three are closed by the same change and argued from the code; no sanitizer
 report is claimed for any of them.
 
-The reproducer added to the suite runs four client sessions against one daemon,
-and every one separates the two trees. Ending a chunk transfer with nothing
-offered afterwards must give the terminal response then end of file;
-unremediated, the server reads on in clear and the receive timeout answers
-instead. Pushing one byte in clear after the shutdown must give the same
-terminal response; unremediated, that byte is read as the chunk's completion
-and the chunk accepted. Cutting a command line in half and supplying the rest
-in clear must end the input; unremediated, the halves are joined and the
-address so assembled accepted. A shutdown between commands must leave a socket
-refusing a transaction, an address lookup and an offer of credentials with 530
-while answering a fresh greeting whose extension set is recomputed;
-unremediated, the transaction is accepted. No run emits either the chunked-body
-double-push or double-pop diagnostic.
+The reproducer added to the suite drives one client session against a daemon of
+its own, and it separates the two trees. It declares a chunk, sends all but one
+byte of it, and then shuts the session down with the socket left open; the
+server must answer with the terminal response and then be at end of file. Both
+halves of that are asserted, and both are needed: unremediated, the server
+reads on in clear, finds nothing there, and answers only when the receive
+timeout expires - which is why the response is matched in full rather than by
+its code, a loose match being satisfied by the timeout's own answer - and it
+leaves the socket readable rather than ended. None of the runs recorded here
+emitted the chunked-body double-push or double-pop diagnostic.
 
-Two things the suite cannot express were checked outside it with a
-purpose-built client, the harness client being unable to negotiate again after
-its shutdown - which finalises the library - or to select a protocol version or
-server name. First, a session ended between commands followed by a second on
-the same connection: remediated, a submission in clear between them is refused,
-and the second session's message is logged with its own version, cipher and no
-server name, the first session's ACL variables gone; unremediated, that
-submission is accepted and the second message logged with the first session's
-version, cipher and server name. Second, removing just the transfer-state
-resets at the two allocation sites makes the suite's
-multi-message-over-one-connection scenario fail, in four of its recorded
-outputs, the successor session beginning life holding its predecessor's
-end-of-file; it recovers when they are restored, which is why that item is part
-of the fix rather than optional hardening.
+The two allocation sites initialise the transfer state belonging to the buffer
+they allocate. On the transplant path that is structural: the context is copied
+wholesale from an outbound connection and then given a buffer of its own, so
+the state describing what it reads has to begin afresh against that buffer. At
+the handshake site it keeps buffer and state allocated together; the successive
+sessions on one connection that the code's own comment describes are no longer
+reachable on the server path, teardown now ending the input, and no scenario in
+the suite was found that fails when the two initialisations are removed - so
+that item is stated here as structural correctness, not as a measured
+regression.
 
 The regression witnesses behave as before - chunked reception and transmission
 with and without TLS, the state-transplant paths, signature verification, early
-pipelining, and the tests taking several messages over one connection with the
-session ended between them. The whole automatic range was run on both trees in
-final validation: the set that fails consistently is the same on each, so the
-remediated tree introduces no failure of its own.
+pipelining and per-recipient data. Six recorded outputs, across three tests,
+change, and only for the re-use described above: each hands a connection on
+after shutting its session down, and now uses a connection per message,
+delivering the same messages. Those six were re-derived from observed output and
+read line by line; nothing was accepted wholesale.
+
+The whole automatic range was then run on each tree, and on each with both TLS
+backends built: every test that fails on the remediated tree fails on the
+unremediated one too, and none fails there that passes on it - with one
+exception, a client-side debug transcript of which the suite keeps a single
+saved copy. The two TLS client libraries do not close a session identically:
+one of them absorbs the first bytes of a plaintext response while waiting for a
+closing alert, so that copy matches one and not the other. Everything the
+server records matches on both. The reproducer is in the remediated tree only,
+which is what it is for.
 
 ================================================================================
 STATUS AND IDENTIFIERS
