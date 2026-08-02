@@ -1,107 +1,62 @@
 Subject: [oss-security] EXIM-Security-2026-07-31.1: Exim 4.100: remote
  pre-authentication heap corruption in the GnuTLS chunked-transfer path
 To: oss-security <oss-security@lists.openwall.com>
-Cc: exim-maintainers <exim-maintainers@lists.exim.org>
 MIME-Version: 1.0
 Content-Transfer-Encoding: 8bit
 Content-Type: text/plain; charset=utf-8
 
 Dear Exim users,
 
-we have identified, by code inspection of our own source, a heap use-after-free
-in the GnuTLS-backed SMTP server.  It is reached when a TLS session is torn
-down while a chunked body transfer - BDAT, from the CHUNKING extension - is
-still in progress.  The per-session TLS transfer buffer is released and the
-session object destroyed while the reader callbacks bound to that buffer stay
-installed and keep being dispatched: buffer, session handle and callbacks did
-not share a lifetime.
+we have identified, by code inspection, a heap use-after-free in the
+GnuTLS-backed SMTP server. A TLS session torn down while a chunked body
+transfer (BDAT, from the CHUNKING extension) is still in progress releases the
+transfer buffer and destroys the session while the reader callbacks bound to
+them stay installed and keep being dispatched.
 
-A remote, unauthenticated attacker can reach this on a stock build with a stock
-configuration: both preconditions - CHUNKING and STARTTLS - are advertised by
-default, and neither advertisement involves authentication.  The dialogue is an
-ordinary one: connect, EHLO, STARTTLS, EHLO, MAIL FROM, RCPT TO, then BDAT with
-fewer body bytes sent than were declared, then a TLS close_notify with the TCP
-socket left open.  There is no race window to win, no credential to obtain and
-no prior information leak to arrange.
+A remote, unauthenticated attacker can reach it on a stock build and
+configuration, CHUNKING and STARTTLS both being advertised by default, by
+ending a TLS session mid-chunk with the socket left open. The consequence is
+heap corruption - attacker-supplied bytes decoded into a freed allocation - and
+we have not developed an exploit chain beyond that. A use-after-free read and a
+silent continuation in clear are reachable alongside it.
 
-The consequence is heap corruption: attacker-supplied bytes decoded into a
-freed allocation, repeatedly, in a process parsing untrusted input.  We have
-not developed an exploit chain beyond that, and make no claim about how far one
-could be taken.  A use-after-free read and a dereference of the destroyed
-session handle are reachable on adjacent paths.  There is also a
-confidentiality failure: after the session had been destroyed the read path
-silently continued reading the same TCP socket in clear, as though the
-encrypted session were still there.
+Affected: builds using the GnuTLS backend - the 4.100 development tree and all
+preceding releases that shipped that backend with CHUNKING support, which we
+cannot narrow further. OpenSSL builds are affected differently and far less
+severely; that lesser exposure is not addressed here and remains as it was.
 
-Affected: builds using the GnuTLS backend.  Present in the 4.100 development
-tree and, on the evidence of our own release record, in all preceding releases
-that shipped the GnuTLS backend with CHUNKING support; we cannot narrow the
-earliest affected release further from the information available to us.  Builds
-using the OpenSSL backend are affected differently and far less severely - that
-backend never releases the transfer buffer, so the heap corruption does not
-arise there, and the equivalent stale-reader path reaches a read with a
-destroyed session, crashing the one forked per-connection process rather than
-corrupting the heap.  That lesser exposure is closed here as well: the decision
-taken when a peer ends a session, and the retirement of the saved chunked-body
-readers, are shared code, and the OpenSSL teardown now reaches both.  The
-readers of that backend are themselves unchanged.
+Remediation is prepared: buffer, session handle and the callbacks operating on
+both are given a single, jointly enforced lifetime. The change is confined to
+the GnuTLS transfer-buffer lifetime logic and the chunked-body handling; no
+other TLS backend source is edited. No public API or ABI, SMTP wire protocol,
+spool format, configuration option or default, or chunking_state_t transition
+changes. Two changes are visible to operators. A session ended during a
+transaction now fails closed: nothing further is read and the message in
+progress fails, though a terminal 421 for the lost connection still goes out,
+in clear, before the close. A session ended cleanly between commands still lets
+the connection continue - but as a plain one, the authentication and the
+reported TLS status going with the session, a fresh HELO/EHLO required, and
+MAIL or AUTH offered in clear refused with the 530 of RFC 3207. STARTTLS is
+offered again and a successful one restores the connection, so the smtp
+transport's handoff of an open connection still works.
 
-Remediation is prepared.  Buffer, session handle and the callbacks operating on
-both are given a single, jointly enforced lifetime; the saved chunked-body
-reader vector can no longer dispatch a TLS reader; and the routines that would
-have used a released object fail closed instead.
+One workaround exists, as a compensating control rather than a fix: restricting
+chunking_advertise_hosts so that CHUNKING is not advertised removes the
+trigger, at the cost of a standards-defined SMTP capability. On our handling of
+security releases and vendor backports see <https://wiki.exim.org/EximSecurity>
+and <https://wiki.exim.org/SecurityReleaseProcess>.
 
-Two changes are visible to operators, and we would rather state them here than
-have them found later.
-
-Teardown during a transaction now fails closed.  Traffic arriving on the socket
-afterwards is not read, the message in progress fails, and no further SMTP
-command is taken from that connection.  For precision: the server does still
-emit a terminal failure response before closing, and because the session is
-already gone that response goes out in clear.  What is guaranteed is about the
-read path, not that nothing at all is transmitted after teardown.
-
-Teardown between commands is a different case, and we keep it working, because
-handing a connection on in clear after ending a session is something Exim
-documents and does itself.  Such a connection continues - but now as a plain
-connection and nothing more.  Everything the ended session conferred is dropped
-with it: a sender authenticated under TLS, the identity that authentication
-established, and the reported TLS status - version, cipher, certificate
-verification result - all of which previously stayed attached to the connection
-and were applied to, and logged for, messages accepted in clear afterwards.
-STARTTLS is offered again.  A peer that relied on authentication or on TLS
-status carrying across a session teardown has to authenticate, or negotiate,
-again.
-
-There is one workaround, and it is a compensating control rather than a fix:
-restricting chunking_advertise_hosts so that CHUNKING is not advertised removes
-the trigger.  It takes an explicit configuration change - the option's default
-is "*" - it withdraws a standards-defined SMTP capability from every peer, and
-it leaves the defect in place for anyone who restores the advertisement.
-Install a build containing the fix instead.  For how we handle security
-releases and vendor backports see <https://wiki.exim.org/EximSecurity> and
-<https://wiki.exim.org/SecurityReleaseProcess>.
-
-No public identifier is asserted for this issue.  We claim no CVE identifier,
-no severity score and no advisory reference for it: none could be retrieved
-when this was written.  Any identifier found elsewhere in the Exim source tree
-belongs to a different, historical issue and must not be associated with this
-one.  Following our own convention this advisory is named for the date the
-issue was raised, and an alias may be added later if an identifier is assigned.
-This notice carries no sender, date or transport metadata: none has been
-assigned to it, and none is invented here.
+No public identifier is asserted: we claim no CVE identifier and no advisory
+reference, none having been retrievable when this was written. Any identifier
+found elsewhere in the Exim source tree belongs to a different, historical
+issue. This notice carries no sender, date or transport metadata; none is
+invented here. The full technical report is the report.txt file alongside it.
 
 2026-07-31: identified by code inspection
 2026-07-31: remediation prepared
-
+2026-08-02: remediation reviewed, revised and verified
 planned:
-2026-08-04 15:00UTC: publish the fix via the distros repo (accessible for the
-                     distro packagers)
-2026-08-07 15:00UTC: publish the fix via the default repo (accessible for the
-                     public)
-
-The full technical report - the affected code paths, the reachability analysis,
-the remediation and how it was verified - is the report.txt file alongside this
-announcement.
+2026-08-04 15:00UTC: publish the fix via the distros repo (distro packagers)
+2026-08-07 15:00UTC: publish the fix via the default repo (the public)
 
     The Exim maintainers

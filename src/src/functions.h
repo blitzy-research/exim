@@ -138,7 +138,6 @@ extern uschar *bdat_getbuf(unsigned *);
 extern BOOL    bdat_hasc(void);
 extern int     bdat_ungetc(int);
 extern void    bdat_flush_data(void);
-extern void    bdat_invalidate_receive_functions(void);
 
 extern void    bits_clear(unsigned int *, size_t, int *);
 extern void    bits_set(unsigned int *, size_t, int *);
@@ -534,7 +533,6 @@ extern uschar *smtp_getbuf(unsigned *);
 extern void    smtp_get_cache(unsigned);
 extern BOOL    smtp_hasc(void);
 extern int     smtp_handle_acl_fail(int, int, uschar *, uschar *);
-extern void    smtp_input_retire(void);
 extern void    smtp_log_no_mail(void);
 extern void    smtp_message_code(uschar **, int *, uschar **, uschar **, BOOL);
 extern void    smtp_notquit_exit(const uschar *, uschar *, const uschar *, ...);

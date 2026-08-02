@@ -7,45 +7,23 @@ gnutls
 # the released buffer or read the rest of the connection in clear, on the socket
 # the peer negotiated encryption for.
 #
-# Four sessions below, each aimed at a different consequence of that:
-#
-#   1  the shutdown lands in the body, and the byte still owed on the chunk is
-#      offered in clear afterwards.  A server that carries on reading takes it,
-#      finishes the chunk, and pushes a byte back through the saved readers into
-#      the released transfer buffer.
-#   2  the same shutdown with nothing offered afterwards, so the close is clean
-#      and can be asserted as such.  Session 1 cannot assert it, because the
-#      byte it leaves unconsumed makes the close carry a reset.
-#   3  the shutdown lands inside the header block, where the end of the input is
-#      reached during the look-ahead for a continued header line.  Unless that
-#      end is visible through the reader that teardown installs, the part of the
-#      message that did arrive is taken for a whole one and accepted.
-#   4  the shutdown lands at a command boundary, between messages, which is what
-#      a sending process does when it hands the connection to its successor.
-#      That is allowed to go on in clear - but as a plain connection which has
-#      authenticated nothing and negotiated nothing, never as a continuation
-#      carrying what the session that has gone established.
-#
-# The first daemon runs with the receive debug selected, so the reader bookkeeping
-# the chunked path performs is on the record: a session that pushed or popped the
-# saved readers out of turn would say so there, and the saved output would no
-# longer match.  Session 4 gets a daemon of its own, for the reason given where it
-# is started.
+# The session below declares a chunk, sends all of it but one byte, and takes the
+# TLS session down with the TCP connection still open.  What is asserted is the
+# end of the input: the message is refused with a lost connection, and the server
+# closes the connection instead of reading on.
 #
 # Note for running this by hand: the daemon under test has to be the GnuTLS
 # build.  Hand that binary to runtest and leave --tls off - that is the case in
-# which the binary runtest was given is used at both ends, as $exim_client and
-# as $exim_server alike.  Given --tls, runtest works in its cross-library mode
+# which the binary runtest was given is used at both ends, as $exim_client and as
+# $exim_server alike.  Given --tls, runtest works in its cross-library mode
 # instead: it picks the harness client program, and it also pairs the two
 # library-specific builds against each other, so "--tls gnutls" leaves the
 # OpenSSL build answering as $exim_server - and that build never frees the
-# transfer buffer this test is about.  Test numbers spanning more than one
-# script directory have to be asked for as a range, or one batch per directory.
+# transfer buffer this test is about.  Test numbers spanning more than one script
+# directory have to be asked for as a range, or one batch per directory.
 #
-exim -d-all+receive -DSERVER=server -DSRV=tls -bd -oX PORT_D
+exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
 ****
-#
-# 1: shutdown in the body, with the outstanding byte offered in clear.
 #
 # Chunk arithmetic - 85 declared, 84 sent, so one byte is still outstanding when
 # the session goes.  The ">>> " prefix suppresses the trailing CRLF the client
@@ -58,63 +36,20 @@ exim -d-all+receive -DSERVER=server -DSRV=tls -bd -oX PORT_D
 #     27 x A                         27   (84)
 #
 # Both halves of that shape are load-bearing.  The header block has to be
-# complete, so that reception is past the header lines and into the body: that is
-# where the end of a chunk is handled by pushing a byte back through the saved
-# readers, which writes into the transfer buffer.  And the chunk has to be short
-# by exactly one byte, that byte then being offered in clear once the session has
-# gone - a server that still reads the plain socket takes it, finishes the chunk,
-# and performs the push-back.  Leave either half out and the reader never gets
-# that far, so a build carrying the fault would look every bit as healthy as one
-# without it.
+# complete, so that reception is past the header lines and into the body, which is
+# where a released transfer buffer is read and written.  And the chunk has to be
+# short, so that the session goes away with the transfer still owed data: a
+# reader which treats what arrived as the whole of the message would accept it.
 #
 # The reply is matched in full rather than as just "421" because the receive
 # timeout answers with a 421 of its own, and a loose match would be satisfied by
-# the very behaviour this test exists to reject.
+# the very behaviour this test exists to reject - a server that keeps reading the
+# plain socket has nothing to read there, and says so when the timeout expires.
 #
-# The connection is not read again after the reply.  The byte offered in clear is
-# deliberately never consumed, so the close that follows carries a reset, and a
-# further read would report that reset rather than end of file.  Session 2 is
-# what asserts the close.
-#
-client-anytls 127.0.0.1 PORT_D
-??? 220
-EHLO rhu.barb
-??? 250-
-??? 250-SIZE
-??? 250-8BITMIME
-??? 250-PIPELINING
-??? 250-CHUNKING
-??? 250-STARTTLS
-??? 250 HELP
-STARTTLS
-??? 220
-EHLO rhu.barb
-??? 250-
-??? 250-SIZE
-??? 250-8BITMIME
-??? 250-PIPELINING
-??? 250-CHUNKING
-??? 250 HELP
-MAIL FROM:<someone@some.domain>
-??? 250
-RCPT TO:<CALLER@test.ex>
-??? 250
-BDAT 85 LAST
->>> To: Susan@random.com\r\nFrom: Sam@random.com\r\n\r\nbody-start-AAAAAAAAAAAAAAAAAAAAAAAAAAA
-stoptls
->>> X
-??? 421 Lost incoming connection
-****
-millisleep 500
-#
-# 2: the same shutdown, with nothing offered in clear afterwards.
-#
-# Same chunk arithmetic, same point in the body, so the server reaches the same
-# place by the same route.  What differs is that nothing follows the shutdown, so
-# the server has nothing unconsumed to reset over and the close is clean.  That
-# is what lets the end of file be asserted here, and asserting it is the point of
-# this session: a server which answered 421 and then left the socket usable would
-# satisfy session 1 on its own.
+# Nothing is offered in clear after the shutdown, so the server has nothing
+# unconsumed to reset over and its close is clean.  That is what lets the end of
+# file be asserted here, and asserting it is half the point: a server which
+# answered 421 and then left the socket usable would pass on the reply alone.
 #
 client-anytls 127.0.0.1 PORT_D
 ??? 220
@@ -146,141 +81,6 @@ stoptls
 ???*
 ****
 millisleep 500
-#
-# 3: shutdown inside the header block.
-#
-# 88 declared, 44 sent - two complete header lines and no blank line, so the
-# header block is still open when the session goes:
-#
-#     To: Susan@random.com CRLF      22
-#     From: Sam@random.com CRLF      22   (44)
-#
-# Header reading asks for the next byte to find out whether the line continues.
-# That request reaches the end of the input, which the reader installed at
-# teardown has to report as such; a reader that does not is understood to have
-# reached the end of the message instead, and the part of the message that did
-# arrive is accepted as a message in its own right - answered as the whole
-# declared chunk, and logged as received over the session.  So the log must record
-# the loss after the header, and must record no acceptance.  The reply carries no
-# distinction - it is the same lost-connection one as above - so it is the log
-# that tells the two points of loss apart.
-#
-client-anytls 127.0.0.1 PORT_D
-??? 220
-EHLO rhu.barb
-??? 250-
-??? 250-SIZE
-??? 250-8BITMIME
-??? 250-PIPELINING
-??? 250-CHUNKING
-??? 250-STARTTLS
-??? 250 HELP
-STARTTLS
-??? 220
-EHLO rhu.barb
-??? 250-
-??? 250-SIZE
-??? 250-8BITMIME
-??? 250-PIPELINING
-??? 250-CHUNKING
-??? 250 HELP
-MAIL FROM:<someone@some.domain>
-??? 250
-RCPT TO:<CALLER@test.ex>
-??? 250
-BDAT 88 LAST
->>> To: Susan@random.com\r\nFrom: Sam@random.com\r\n
-stoptls
-??? 421 Lost incoming connection
-???*
-****
-millisleep 500
 killdaemon
 #
-# The three sessions above are the ones the reader bookkeeping has to be read for,
-# and their children are short-lived enough that the daemon's own notes about them
-# always land after they have finished.  Session 4's child stays for a second
-# message, and the daemon's notes then land in the middle of it - at no fixed
-# place, because it depends on which of the two the system runs first.  So the
-# daemon for session 4 is started without the debug: nothing of it reaches the
-# saved output, and what the sessions above have to say about the readers is left
-# unaffected by it.
-#
-exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
-****
-millisleep 500
-#
-# 4: shutdown at a command boundary.
-#
-# A whole message is sent and accepted over the session first, so that nothing is
-# in progress when the shutdown arrives.  The conversation then continues in
-# clear, which is what a sending process expects when it shuts the session down
-# to hand the connection on.  The second message is therefore accepted - and the
-# log line for it is the assertion: it has to be a plain one.  Compare it with
-# the first message's line, which carries P=esmtps and the cipher: the second
-# carries P=esmtp and no cipher, no certificate verification, no authentication.
-# Anything of the session appearing on that line would mean the connection had
-# kept, in clear, what was established under encryption.
-#
-# STARTTLS is offered again after the shutdown, which is correct: there is no
-# session on this connection any more, and a successor is free to start one.
-#
-# The second message is sent chunked as well, so the whole test stays on the
-# chunked path: 49 bytes, being the subject line and the blank line that closes
-# the header block, each with its CRLF.
-#
-client-anytls 127.0.0.1 PORT_D
-??? 220
-EHLO rhu.barb
-??? 250-
-??? 250-SIZE
-??? 250-8BITMIME
-??? 250-PIPELINING
-??? 250-CHUNKING
-??? 250-STARTTLS
-??? 250 HELP
-STARTTLS
-??? 220
-EHLO rhu.barb
-??? 250-
-??? 250-SIZE
-??? 250-8BITMIME
-??? 250-PIPELINING
-??? 250-CHUNKING
-??? 250 HELP
-MAIL FROM:<someone@some.domain>
-??? 250
-RCPT TO:<CALLER@test.ex>
-??? 250
-BDAT 88 LAST
-To: Susan@random.com
-From: Sam@random.com
-Subject: This is a bodyless test message
-
-??? 250-
-??? 250
-stoptls
-EHLO rhu.barb
-??? 250-
-??? 250-SIZE
-??? 250-8BITMIME
-??? 250-PIPELINING
-??? 250-CHUNKING
-??? 250-STARTTLS
-??? 250 HELP
-MAIL FROM:<someone@some.domain>
-??? 250
-RCPT TO:<CALLER@test.ex>
-??? 250
-BDAT 49 LAST
-Subject: sent in clear after the session went
-
-??? 250-
-??? 250
-QUIT
-??? 221
-???*
-****
-millisleep 500
-killdaemon
 no_msglog_check

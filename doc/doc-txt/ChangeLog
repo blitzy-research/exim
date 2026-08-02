@@ -83,19 +83,17 @@ JH/20 Bug 3184: Disable the -bI:sieve command-line option when built without
 JH/21 Fix use-after-free in the GnuTLS transfer buffer.  A TLS session shut
       down during a chunked (BDAT) body transfer released the buffer and
       session while the readers bound to them stayed installed.  All three now
-      share one lifetime: both pointers are nulled at release, the transfer
-      state is reset, the saved chunked-body receive functions no longer refer
-      to the TLS readers, and the routines using them fail closed.  Peer
-      teardown is now decided on the read path before the session is
-      released: during a transaction the input is ended, so the message fails
-      and the connection is not read on; at a command boundary the connection
-      carries on as a plain one, dropping the authentication and the TLS
-      status that the ended session conferred.  One consequence for
-      Exim-to-Exim delivery: the smtp transport hands an open connection to
-      the next delivery process by shutting TLS down and trying a cleartext
-      EHLO on the same socket.  That handoff still works, but the connection
-      it hands over is a plain one, so a message taken on it is no longer
-      recorded as having arrived under TLS.
+      share one lifetime and the routines using them fail closed; a session
+      ending before its handshake completes is reported as a handshake
+      failure.  Releasing the session also settles the input.  Unless it ended
+      between commands with nothing in flight the input is ended, so the
+      message fails, the socket is not read on and the peer gets a terminal
+      421.  Ended between commands the connection carries on as a plain one,
+      dropping the authentication, the TLS status and the greeting state that
+      the session conferred; MAIL or AUTH in clear is then refused with the
+      530 of RFC 3207, while a further STARTTLS is accepted, so the smtp
+      transport's handoff of an open connection still works and the message
+      following it is again taken under TLS.
 
 
 Exim version 4.99.1

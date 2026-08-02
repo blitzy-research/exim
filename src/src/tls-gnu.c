@@ -617,15 +617,13 @@ ssize_t inbytes;
 which also nulls both pointers.  Note that we can be re-entered after that has
 happened: tls_close() is called from the end-of-transmission branch below, so
 the agent that releases the buffer and the consumer that would next read into
-it are the same call chain.  Fail closed rather than hand released memory to
-the library, and retire the input so that the plain readers do not take up the
-socket in its place. */
+it are the same call chain.  Fail closed rather than hand released memory to the
+library; what the connection may do next was settled by tls_close(). */
 
 if (!state->session || !state->xfer_buffer)
   {
   DEBUG(D_tls) debug_printf("TLS read after session teardown\n");
   state->xfer_error = TRUE;
-  smtp_input_retire();
   return FALSE;
   }
 
@@ -654,14 +652,13 @@ if (had_data_sigint)
   smtp_data_sigint_exit();
 
 /* Timeouts do not get this far.  A zero-byte return means the TLS session has
-ended even if the socket remains open; tear down, and settle what is left of the
-connection before anything reads it again. */
+ended even if the socket remains open; tear it down, which also settles what is
+left of the connection before anything reads it again. */
 
 if (sigalrm_seen)
   {
   DEBUG(D_tls) debug_printf("Got tls read timeout\n");
   state->xfer_error = TRUE;
-  smtp_input_retire();
   return FALSE;
   }
 
@@ -670,12 +667,10 @@ else if (inbytes == 0)
   DEBUG(D_tls) debug_printf("Got TLS_EOF\n");
 
   /* The peer has taken the session down while we were reading it, and the socket
-  beneath it is still open.  Settle what the remains of this connection are
-  before the session goes and before the readers are pointed back at that
-  socket; smtp_tls_session_ended() either retires the input or downgrades the
-  connection explicitly, and every reader from here on answers accordingly. */
+  beneath it is still open.  tls_close() releases the session and its buffer,
+  points the readers back at that socket, and settles what the remains of this
+  connection may do; every reader from here on answers accordingly. */
 
-  smtp_tls_session_ended();
   tls_close(NULL, TLS_NO_SHUTDOWN);
   return FALSE;
   }
@@ -687,7 +682,6 @@ else if (inbytes < 0)
   DEBUG(D_tls) debug_printf("%s: err from gnutls_record_recv\n", __FUNCTION__);
   record_io_error(state, (int) inbytes, US"recv", NULL);
   state->xfer_error = TRUE;
-  smtp_input_retire();
   return FALSE;
   }
 #ifndef DISABLE_DKIM
@@ -3196,8 +3190,14 @@ DEBUG(D_tls) debug_printf("initialising GnuTLS as a server\n");
 #endif
 
 #ifdef EXIM_TLS_EARLY_BANNER
-  if (banner && state_server.verify_requirement == VERIFY_NONE)
-    state_server.early_banner = TRUE;
+  /* Assign rather than only set: the one server context is re-used for
+  successive sessions on a single TCP connection and is never re-zeroed, so a
+  session started with no banner to send - a STARTTLS after an implicit-TLS
+  session on the same connection has ended - must not inherit the flag from its
+  predecessor and go on to dereference a null banner below. */
+
+  state_server.early_banner =
+    banner && state_server.verify_requirement == VERIFY_NONE;
 #endif
   if ((rc = tls_init(NULL, NULL,
       tls_require_ciphers, &state, &tls_in, errstr)) != OK) return rc;
@@ -3323,7 +3323,19 @@ if (  gnutls_protocol_get_version(state->session) > GNUTLS_TLS1_2
   gstring_reset(banner);
 
   DEBUG(D_tls) debug_printf("TLS: wait for handshake complete\n");
-  tls_refill(GETC_BUFFER_UNLIMITED);
+
+  /* A failure here is the session not surviving the wait: the peer went away, or
+  the read timed out.  tls_refill() tears the session down in the first case, so
+  nothing below - the flag query, the resumption bookkeeping, the debug of the
+  peer, the expansion variables - may touch it.  Report a failed handshake, and
+  send no alert: there may be no session left to send one on. */
+
+  if (!tls_refill(GETC_BUFFER_UNLIMITED))
+    {
+    (void) tls_error(US"handshake",
+	      US"session ended before the handshake completed", NULL, errstr);
+    return FAIL;
+    }
   }
 #endif
 
@@ -4018,13 +4030,14 @@ if (do_shutdown && state->session)
 
 if (!ct_ctx)	/* server */
   {
-  /* What becomes of the connection once the session is gone has already been
-  settled by smtp_tls_session_ended(), called from the read path before we get
-  here: either the input was retired, in which case the plain readers installed
-  just below refuse the socket and report the end of the input, or the connection
-  was explicitly downgraded and they own what is left of it.  Nothing about that
-  decision is taken here, so a teardown from a terminal point of the dialogue -
-  QUIT, a rejected connection, a failed STARTTLS - is unaffected by it. */
+  /* Point the top-level readers back at the plain socket, then settle what
+  becomes of the connection now that the session is going.  The order matters:
+  smtp_tls_session_ended() also retires the saved BDAT readers - the chunked path
+  dispatches through its own copy of the vector, and its pop would otherwise
+  reinstate the session readers as the top-level ones - and it does that before
+  the session and the transfer buffer they read through are freed just below.
+  Whether anything more may be read from the socket is its decision, and it is
+  taken once, here, for every way a server-side session can end. */
 
   receive_getc =	smtp_getc;
   receive_getbuf =	smtp_getbuf;
@@ -4034,12 +4047,7 @@ if (!ct_ctx)	/* server */
   receive_feof =	smtp_feof;
   receive_ferror =	smtp_ferror;
 
-  /* Retire the saved BDAT readers too, before the session and the transfer
-  buffer they read through are freed: the chunked path dispatches through its own
-  saved copy of the vector, and its pop would even reinstate those readers as the
-  top-level ones. */
-
-  bdat_invalidate_receive_functions();
+  smtp_tls_session_ended();
   }
 
 if (state->session)
@@ -4080,8 +4088,7 @@ flag leaves a stale TLS reader with an unmistakably finished input.
 Neither flag is what makes the end of the input observable after a server
 teardown: the vector reset above has already pointed the end-of-file check at
 smtp_feof(), which reports the plain reader's own record, and what may still be
-read from the socket underneath is not decided here at all -
-smtp_tls_session_ended() settles that on the read path, before this runs.  A
+read from the socket underneath was decided by smtp_tls_session_ended() above.  A
 later handshake on this same connection is unaffected, because both allocation
 sites clear the pair for the session they start. */
 
@@ -4117,18 +4124,20 @@ clear as if it were a continuation of the encrypted session. */
 
 if (!state->session || !state->xfer_buffer) return EOF;
 
-/* A refill that failed - a read timeout, a library failure, or the peer taking
-the session down - is the end of what this reader owns, so hand the read on to
-the reader that owns whatever is left of the connection.  That is never a
-transparent continuation of the encrypted session: tls_refill() has already
-retired the input for every failure and for a shutdown taken mid-transaction, and
-a retired input is refused by the plain reader, so this answers end-of-file in
-all of those cases.  It reads the socket only where the read path decided the
-connection was explicitly downgraded to plain. */
+/* A refill that failed is the end of what this reader owns.  Which reader owns
+what is left of the connection depends on why it failed, and the session pointer
+says which case this is.  If the session is gone, tls_refill() tore it down
+because the peer ended it, and tls_close() has both installed the plain readers
+and settled whether the socket may be read at all - so hand the read on: that
+yields end-of-file for a retired input, and reads the socket only where the
+teardown explicitly downgraded the connection to plain.  If the session is still
+here, the failure was a read timeout or a library error with the session intact;
+there is no downgrade to speak of and nothing else owns this read, so fail closed
+rather than take the socket underneath in clear. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(lim))
-    return smtp_getc(lim);
+    return state->session ? EOF : smtp_getc(lim);
 
 /* Something in the buffer; return next uschar */
 
@@ -4159,13 +4168,21 @@ if (!state->session || !state->xfer_buffer)
   }
 
 /* As in tls_getc() above: a failed refill ends what this reader owns, and the
-read is handed to the reader that owns the rest of the connection - which refuses
-a retired input, so this reports nothing available for every failure and for a
-shutdown taken mid-transaction. */
+session pointer says who owns the rest.  Gone means the peer ended the session and
+tls_close() settled what may still be read, so hand the read on; still here means
+a timeout or library error with the session intact, so report nothing available
+rather than take the socket underneath in clear. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(*len))
+    {
+    if (state->session)
+      {
+      *len = 0;
+      return NULL;
+      }
     return smtp_getbuf(len);
+    }
 
 if ((size = state->xfer_buffer_hwm - state->xfer_buffer_lwm) > *len)
   size = *len;

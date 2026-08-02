@@ -133,6 +133,7 @@ static struct {
   BOOL helo_verify			:1;
   BOOL helo_seen			:1;
   BOOL helo_accept_junk			:1;
+  BOOL in_cmd_read			:1;
 #ifndef DISABLE_PIPE_CONNECT
   BOOL pipe_connect_acceptable		:1;
 #endif
@@ -350,12 +351,14 @@ static uschar *smtp_inend;
 static int     smtp_had_eof;
 static int     smtp_had_error;
 static BOOL    smtp_input_retired;
+static BOOL    smtp_tls_ended;
 
 
 /* forward declarations */
 static int smtp_read_command(BOOL check_sync, unsigned buffer_lim);
 static void smtp_quit_handler(uschar **, uschar **);
 static void smtp_rset_handler(void);
+static void bdat_invalidate_receive_functions(void);
 
 /*************************************************
 *          Log incomplete transactions           *
@@ -461,12 +464,14 @@ if (!(smtp_inbuffer = US malloc(IN_BUFFER_SIZE)))
   log_write_die(0, LOG_MAIN, "malloc() failed for SMTP input buffer");
 smtp_inbuffer[IN_BUFFER_SIZE-1] = '\0';
 
-/* This is where a new input source begins, and so also the one place where a
-record of a previous one having been retired is dropped. */
+/* This is where a new input source begins, and so also the one place where the
+records of a previous one - that it was retired, and that a TLS session on it
+had ended - are dropped. */
 
 smtp_inptr = smtp_inend = smtp_inbuffer;
 smtp_had_eof = smtp_had_error = 0;
 smtp_input_retired = FALSE;
+smtp_tls_ended = FALSE;
 }
 
 
@@ -475,18 +480,17 @@ smtp_input_retired = FALSE;
 *        Retire the SMTP input on this fd        *
 *************************************************/
 
-/* Called from the TLS layer, for either TLS library, when nothing further may
-be read from this connection: a TLS read failed, or the peer took the session
-down while we were part-way through taking a message.  The socket underneath the
-session is still open, but whatever arrives on it from here on is not part of the
-session the peer negotiated encryption for; reading it would silently continue
-the conversation in clear, and the transaction and authentication state built up
-under encryption would carry on with it.  So there is nothing left to read:
-record the end of this input, which both stops smtp_refill() below from going
-back to the socket - for every plain reader, since they all refill through it -
-and lets smtp_feof(), and therefore the receive_feof() that teardown installs,
-report the end of the message data to the caller that is in the middle of taking
-a message.
+/* Called from smtp_tls_session_ended() below when nothing further may be read
+from this connection: the peer took the TLS session down while we were part-way
+through taking a message.  The socket underneath the session is still open, but
+whatever arrives on it from here on is not part of the session the peer
+negotiated encryption for; reading it would silently continue the conversation in
+clear, and the transaction state built up under encryption would carry on with
+it.  So there is nothing left to read: record the end of this input, which both
+stops smtp_refill() below from going back to the socket - for every plain reader,
+since they all refill through it - and lets smtp_feof(), and therefore the
+receive_feof() that teardown installs, report the end of the message data to the
+caller that is in the middle of taking a message.
 
 No read error is recorded: smtp_ferror() must stay clear, because a
 peer-initiated shutdown is not an I/O failure and the message-abandoned path in
@@ -500,7 +504,7 @@ Arguments:  none
 Returns:    nothing
 */
 
-void
+static void
 smtp_input_retire(void)
 {
 smtp_input_retired = TRUE;
@@ -520,33 +524,55 @@ if (smtp_inbuffer) smtp_inptr = smtp_inend = smtp_inbuffer;
 *   Settle the input after a peer TLS shutdown   *
 *************************************************/
 
-/* Called from the TLS layer of either library when the peer has taken the
-session down under a live read, before the session object and its transfer buffer
-are released and before anything is pointed back at the plain socket.  The socket
-is still open, so this is the point at which the remains of the connection have
-to be settled, one way or the other.  It is deliberately an explicit decision
-with exactly two outcomes, rather than a fall-through to the plain socket:
+/* Called from the server side of a TLS teardown, once the readers installed for
+the session have been pointed back at the plain socket and before the session
+object and its transfer buffer are released.  The socket underneath is still
+open, so this is the point at which the remains of the connection have to be
+settled.  It is deliberately an explicit decision with exactly two outcomes,
+rather than a fall-through to the plain socket, and on neither of them is
+anything that arrives in clear afterwards treated as part of what the session
+carried.
 
-. A shutdown arriving while a transaction is in flight - a sender or recipients
-  accepted, or a chunked body transfer running - has nothing legitimate left to
-  read.  The declared remainder of a message cannot be taken in clear on a
+Unconditionally first: the saved lower-layer reader vector has to stop pointing
+at the session readers.  Resetting the top-level receive_* vector is not
+sufficient on its own, because the chunked-body readers are also called directly
+and their pop reinstalls whatever was saved - see
+bdat_invalidate_receive_functions() below.
+
+Then the decision, which turns on whether we were between commands with nothing
+in flight:
+
+. Any other position is mid-flight, and there is nothing legitimate left to read:
+  a chunked or dot-terminated body, a header block, or an authentication
+  exchange.  The declared remainder of a message cannot be taken in clear on a
   connection the peer negotiated encryption for, and a partly-read body must not
   reach the acceptance path as though it were complete.  Retire the input: every
-  reader then refuses the socket and the caller taking the message sees the end
-  of its input.
+  reader then refuses the socket, and a caller in the middle of taking a message
+  sees the end of its input.  A teardown we initiated ourselves - at QUIT, at a
+  protocol-error drop, or at process exit - lands here too, which is correct:
+  nothing further is to be read on those paths either.
 
-. A shutdown arriving at a command boundary is the shutdown-and-reinitialise
+. A shutdown arriving while we are waiting for a new command, with no sender, no
+  recipients and no chunked transfer running, is the shutdown-and-reinitialise
   handoff that the specification describes for hosts_noproxy_tls, where a client
-  closes TLS on an open connection and the process taking over may start a fresh
+  closes TLS on an open connection and the process taking over starts a fresh
   session on it.  That continuation stays supported, but it is not a continuation
-  of the encrypted session: it is a new, unencrypted one on the same socket.  So
-  drop everything the session conferred before letting it proceed - the
-  authentication it carried and every TLS-derived attribute of the connection -
-  leaving the same state a plain connection starts with (compare the
-  initialisation in smtp_start_session()).  Otherwise a peer could shut the
-  session down and go on in clear while still presenting as authenticated and
-  encrypted, and a message taken in clear would be recorded as having arrived
-  under TLS.
+  of the encrypted session: it is a new, unencrypted dialogue on the same socket,
+  and it continues only so far as starting that successor session, or ending the
+  connection.  So drop everything the session conferred before letting it proceed
+  - the authentication it carried, every TLS-derived attribute of the connection,
+  and the extension and pipelining state that the EHLO inside the session
+  established - leaving the state a plain connection starts with (compare the
+  initialisation in smtp_start_session()).  The peer must then give a fresh
+  HELO/EHLO, and a fresh STARTTLS if it wants encryption again, exactly as on a
+  new connection.  And the record kept in smtp_tls_ended refuses any later
+  attempt to submit a message, or credentials, in clear on this socket - see MAIL
+  and AUTH in smtp_setup_msg(), which answer such an attempt with the 530 that
+  RFC 3207 section 4 prescribes for a server requiring TLS.  Otherwise a peer
+  could shut the session down and carry on in clear while still presenting as
+  authenticated and encrypted, having a message accepted on a connection it
+  negotiated encryption for, or offering credentials with nothing protecting
+  them.
 
 Arguments:  none
 Returns:    nothing
@@ -555,16 +581,32 @@ Returns:    nothing
 void
 smtp_tls_session_ended(void)
 {
-if (sender_address || recipients_count > 0 || chunking_state >= CHUNKING_ACTIVE)
+/* A session has ended on this connection.  Whatever is decided below about what
+may still be read, nothing may be submitted in clear from here on: only another
+session can lift that. */
+
+smtp_tls_ended = TRUE;
+
+/* The chunked-body layer dispatches through the saved lower-layer vector, so
+that has to be taken off the session readers whichever way the decision below
+goes. */
+
+bdat_invalidate_receive_functions();
+
+if (  !fl.in_cmd_read
+   || sender_address || recipients_count > 0
+   || chunking_state >= CHUNKING_ACTIVE
+   )
   {
-  DEBUG(D_tls) debug_printf("TLS session ended mid-transaction: retiring input\n");
+  DEBUG(D_tls)
+    debug_printf("TLS session ended: retiring SMTP input on this connection\n");
   smtp_input_retire();
   return;
   }
 
 DEBUG(D_tls)
   debug_printf("TLS session ended at a command boundary: "
-    "downgrading connection to plain, dropping session state\n");
+    "continuing in clear, dropping session state\n");
 
 /* Authentication accepted inside the session does not survive it.  The STARTTLS
 handler below clears the first three when a session starts, and
@@ -575,11 +617,31 @@ sender_host_auth_pubname = sender_host_authenticated = NULL;
 authenticated_id = NULL;
 authenticated_by = NULL;
 
+/* Nor does the greeting that was given inside the session, nor anything derived
+from it.  Requiring a fresh HELO/EHLO is what makes the rest of this reliable:
+the advertised extension set, the pipelining state and the synchronisation limit
+are all recomputed by the EHLO handler, and until then they read as they do on a
+connection that has not been greeted.  These are the same fields that a
+successful STARTTLS drops for the mirror-image reason. */
+
+fl.helo_seen = fl.esmtp = FALSE;
+fl.auth_advertised = FALSE;
+fl.dsn_advertised = FALSE;
+#ifdef SUPPORT_I18N
+fl.smtputf8_advertised = FALSE;
+#endif
+f.smtp_in_pipelining_advertised = FALSE;
+sync_cmd_limit = NON_SYNC_CMD_NON_PIPELINING;
+f.chunking_offered = FALSE;
+chunking_state = CHUNKING_NOT_OFFERED;
+
 #ifndef DISABLE_TLS
-/* Nor does anything the session said about the peer or the cipher: these feed
-the ACL condition tests, the expansion variables and the log lines for whatever
-is taken next, and what is taken next arrives in clear.  tls_close() clears the
-active socket and context, and the channel binding, immediately after this. */
+fl.tls_advertised = FALSE;
+
+/* Nothing the session said about the peer or the cipher survives either: these
+feed the ACL condition tests, the expansion variables and the log lines for
+whatever is taken next, and what is taken next arrives in clear.  tls_close()
+clears the active socket and context, and the channel binding, around this. */
 
 tls_in.ver = tls_in.cipher = NULL;
 tls_in.cipher_stdname = NULL;
@@ -590,6 +652,7 @@ tls_in.certificate_verified = FALSE;
 tls_in.verify_override = FALSE;
 tls_in.ext_master_secret = FALSE;
 tls_in.ocsp = OCSP_NOT_REQ;
+tls_in.on_connect = FALSE;
 # ifdef SUPPORT_DANE
 tls_in.dane_verified = FALSE;
 tls_in.tlsa_usage = 0;
@@ -598,6 +661,39 @@ tls_in.tlsa_usage = 0;
 tls_in.resumption = 0;
 # endif
 #endif
+
+/* With no greeting and no session, the protocol recorded for anything taken from
+here on is the one a plain connection starts with; EHLO, AUTH and STARTTLS each
+recompute it as they are accepted. */
+
+received_protocol =
+  (sender_host_address ? protocols : protocols_local) [pnormal];
+}
+
+
+
+/*************************************************
+*   Is submission in clear refused on this conn? *
+*************************************************/
+
+/* True once a server-side TLS session has ended on this connection and no
+successor one has started, so that the socket is in clear again.  What the ended
+session conferred was dropped when it went (see smtp_tls_session_ended() above),
+and nothing may be submitted on the socket until another session is negotiated:
+a message would otherwise be accepted on a connection the peer negotiated
+encryption for, and credentials would be offered with nothing protecting them.
+The shutdown-and-reinitialise handoff is unaffected, since it exists to start
+that successor session; the callers answer anything else with the 530 that RFC
+3207 section 4 prescribes for a server requiring TLS.
+
+Arguments:  none
+Returns:    TRUE if a submission command must be refused
+*/
+
+static BOOL
+smtp_in_clear_after_tls(void)
+{
+return smtp_tls_ended && tls_in.active.sock < 0;
 }
 
 
@@ -1116,7 +1212,7 @@ lwr_receive_ungetc = NULL;
 *       Remap saved lower-layer receive fns      *
 *************************************************/
 
-/* Called from the server-side TLS teardown, so that readers a chunked-body
+/* Called from smtp_tls_session_ended() above, so that readers a chunked-body
 transfer saved cannot outlive the session they read through.  A pushed vector is
 remapped onto the plain SMTP readers rather than cleared, because the bdat_*
 dispatch sites call through it untested, and a null lwr_receive_getc keeps its
@@ -1124,15 +1220,14 @@ meaning as the "nothing pushed" state that the push and pop above key on.  That
 also makes this safe when CHUNKING was never used, safe to call more than once,
 and idempotent once the saved vector already names the plain readers.
 
-What those remapped readers are then allowed to read is not settled here: the
-read path settles it, through smtp_tls_session_ended() above, before the session
-is released.
+What those remapped readers are then allowed to read is not settled here; the
+caller settles it, before the session is released.
 
 Arguments:  none
 Returns:    nothing
 */
 
-void
+static void
 bdat_invalidate_receive_functions(void)
 {
 if (!lwr_receive_getc) return;
@@ -1451,6 +1546,14 @@ BOOL hadnull = FALSE;
 had_command_timeout = 0;
 os_non_restarting_signal(SIGALRM, command_timeout_handler);
 
+/* Mark the one position in the dialogue at which a TLS session ending is a
+handoff rather than a truncation: waiting for the first character of a new
+command, with nothing being read on behalf of a message or an authentication
+exchange and no part-line accumulated.  smtp_tls_session_ended() above reads
+this, and is reached from inside the read below. */
+
+fl.in_cmd_read = TRUE;
+
 /* Read up to end of line */
 
 while ((c = (receive_getc)(buffer_lim)) != '\n')
@@ -1460,6 +1563,7 @@ while ((c = (receive_getc)(buffer_lim)) != '\n')
 
   if (c < 0 || ptr >= SMTP_CMD_BUFFER_SIZE)
     {
+    fl.in_cmd_read = FALSE;
     os_non_restarting_signal(SIGALRM, sigalrm_handler);
     /* c could be EOF, ERR, or a good (positive) value overflowing the buffer */
     DEBUG(D_receive)
@@ -1476,9 +1580,11 @@ while ((c = (receive_getc)(buffer_lim)) != '\n')
     hadnull = TRUE;
     c = '?';
     }
+  if (ptr == 0) fl.in_cmd_read = FALSE;	/* part-line: no longer a boundary */
   smtp_cmd_buffer[ptr++] = c;
   }
 
+fl.in_cmd_read = FALSE;
 receive_linecount++;    /* For BSMTP errors */
 os_non_restarting_signal(SIGALRM, sigalrm_handler);
 
@@ -4153,6 +4259,16 @@ while (done <= 0)
 	  US"AUTH command used when not advertised");
 	break;
 	}
+
+      /* Nor may credentials be offered in clear on a connection whose TLS
+      session has gone, whatever this authenticator advertises. */
+
+      if (smtp_in_clear_after_tls())
+	{
+	done = synprot_error(L_smtp_protocol_error, 530, NULL,
+	  US"Must issue a STARTTLS command first");
+	break;
+	}
       if (sender_host_authenticated)
 	{
 	done = synprot_error(L_smtp_protocol_error, 503, NULL,
@@ -4756,6 +4872,16 @@ while (done <= 0)
       message_start();
       was_rej_mail = TRUE;               /* Reset if accepted */
       env_mail_type_t * mail_args;       /* Sanity check & validate args */
+
+      /* No message may be taken in clear on a connection whose TLS session has
+      gone; a successor session has to be started first. */
+
+      if (smtp_in_clear_after_tls())
+	{
+	done = synprot_error(L_smtp_protocol_error, 530, NULL,
+	  US"Must issue a STARTTLS command first");
+	break;
+	}
 
       if (!fl.helo_seen)
 	if (  fl.helo_verify_required
@@ -5766,6 +5892,12 @@ while (done <= 0)
 	sender_host_auth_pubname = sender_host_authenticated = NULL;
 	authenticated_id = NULL;
 	sync_cmd_limit = NON_SYNC_CMD_NON_PIPELINING;
+
+	/* This connection is carrying a session again, so submission on it is no
+	longer refused on account of an earlier one having ended. */
+
+	smtp_tls_ended = FALSE;
+
 	DEBUG(D_tls) debug_printf("TLS active\n");
 	break;     /* Successful STARTTLS */
 	}
