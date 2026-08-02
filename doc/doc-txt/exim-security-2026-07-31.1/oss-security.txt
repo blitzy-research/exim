@@ -16,41 +16,51 @@ them stay installed and keep being dispatched.
 A remote, unauthenticated attacker can reach it on a stock build and
 configuration, CHUNKING and STARTTLS both being advertised by default, by
 ending a TLS session mid-chunk with the socket left open. The consequence is
-heap corruption - attacker-supplied bytes decoded into a freed allocation - and
-we have not developed an exploit chain beyond that. A use-after-free read and a
-silent continuation in clear are reachable alongside it.
+heap corruption - attacker-supplied bytes decoded into a freed allocation -
+and we have not developed an exploit chain beyond that. A use-after-free read,
+an expired-pointer dereference and a silent continuation in clear are
+reachable alongside it.
 
 Affected: builds using the GnuTLS backend - the 4.100 development tree and all
 preceding releases that shipped that backend with CHUNKING support, which we
 cannot narrow further. OpenSSL builds are affected differently and far less
-severely; that lesser exposure is not addressed here and remains as it was.
+severely; no OpenSSL backend source is edited here.
 
-Remediation is prepared: buffer, session handle and the callbacks operating on
-both are given a single, jointly enforced lifetime. The change is confined to
-the GnuTLS transfer-buffer lifetime logic and the chunked-body handling; no
-other TLS backend source is edited. No public API or ABI, SMTP wire protocol,
-spool format, configuration option or default, or chunking_state_t transition
-changes. Two changes are visible to operators. A session ended during a
-transaction now fails closed: nothing further is read and the message in
-progress fails, though a terminal 421 for the lost connection still goes out,
-in clear, before the close. A session ended cleanly between commands still lets
-the connection continue - but as a plain one, the authentication and the
-reported TLS status going with the session, a fresh HELO/EHLO required, and
-MAIL or AUTH offered in clear refused with the 530 of RFC 3207. STARTTLS is
-offered again and a successful one restores the connection, so the smtp
-transport's handoff of an open connection still works.
+Remediation is prepared. Buffer, session handle and the callbacks operating on
+both are given a single, jointly enforced lifetime, and what a server session
+records - the peer's server name, its certificate, DN and cipher suite, the
+verification results and the channel-binding type - is cleared where each
+session starts, so a later session on the same connection cannot report it.
+The change is confined to the GnuTLS transfer-buffer lifetime logic and the
+chunked-body handling. No public API or ABI, SMTP wire protocol, spool format,
+configuration option or default, or chunking_state_t transition changes.
 
-One workaround exists, as a compensating control rather than a fix: restricting
-chunking_advertise_hosts so that CHUNKING is not advertised removes the
-trigger, at the cost of a standards-defined SMTP capability. On our handling of
-security releases and vendor backports see <https://wiki.exim.org/EximSecurity>
-and <https://wiki.exim.org/SecurityReleaseProcess>.
+Two changes are visible to operators. A session ended during a transaction, a
+body transfer, an authentication exchange or a part-read command line now
+fails closed - nothing further is read and the message in progress fails -
+though a terminal 421 still goes out, in clear, before the close. A session
+ended cleanly between commands still lets the connection continue, but as a
+plain one: the authentication, every field of the reported TLS status, the
+greeting state and the connection-scope ACL variables all go with the session,
+a fresh HELO/EHLO is required, and until STARTTLS succeeds again the socket
+answers only HELO/EHLO, STARTTLS, NOOP and QUIT, refusing every other command
+with the 530 of RFC 3207 ahead of the handlers, so nothing is begun and no ACL
+runs. A successful STARTTLS restores the connection, so the smtp transport's
+handoff of an open connection still works.
+
+One workaround exists, as a compensating control rather than a fix:
+restricting chunking_advertise_hosts so CHUNKING is not advertised removes the
+trigger, at the cost of a standards-defined SMTP capability. On our handling
+of security releases and vendor backports see
+<https://wiki.exim.org/EximSecurity> and
+<https://wiki.exim.org/SecurityReleaseProcess>.
 
 No public identifier is asserted: we claim no CVE identifier and no advisory
 reference, none having been retrievable when this was written. Any identifier
 found elsewhere in the Exim source tree belongs to a different, historical
 issue. This notice carries no sender, date or transport metadata; none is
-invented here. The full technical report is the report.txt file alongside it.
+invented here. The full technical report and the disclosure chronology are the
+report.txt and timeline files alongside it.
 
 2026-07-31: identified by code inspection
 2026-07-31: remediation prepared

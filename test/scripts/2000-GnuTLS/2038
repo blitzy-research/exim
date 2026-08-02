@@ -7,10 +7,11 @@ gnutls
 # the released buffer or read the rest of the connection in clear, on the socket
 # the peer negotiated encryption for.
 #
-# The session below declares a chunk, sends all of it but one byte, and takes the
-# TLS session down with the TCP connection still open.  What is asserted is the
-# end of the input: the message is refused with a lost connection, and the server
-# closes the connection instead of reading on.
+# Four client sessions run in turn against the one daemon.  The first is the
+# reproducer.  The three after it are negative controls for the other positions
+# the same teardown can arrive at, and each asserts the same thing from a
+# different angle: whatever the peer offers in clear afterwards is not read as a
+# continuation of the session that has gone.
 #
 # Note for running this by hand: the daemon under test has to be the GnuTLS
 # build.  Hand that binary to runtest and leave --tls off - that is the case in
@@ -24,6 +25,8 @@ gnutls
 #
 exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
 ****
+#
+# Session 1 - the reproducer.
 #
 # Chunk arithmetic - 85 declared, 84 sent, so one byte is still outstanding when
 # the session goes.  The ">>> " prefix suppresses the trailing CRLF the client
@@ -79,6 +82,153 @@ BDAT 85 LAST
 stoptls
 ??? 421 Lost incoming connection
 ???*
+****
+#
+# Session 2 - the same teardown, and then the byte itself.
+#
+# Identical up to the shutdown, after which one byte is pushed in clear.  That is
+# the byte the chunk is still owed, and following the released buffer is exactly
+# what a reader would do with it, so this is the shortest path there is to the
+# original fault.  The answer has to be the same lost-connection reply as above:
+# the byte is not what completes the chunk, and no message may be accepted.  A
+# server that reads it answers "250- 85 byte chunk" instead, having taken a chunk
+# as complete on the strength of a byte that arrived in clear.
+#
+# Unlike session 1 this leaves something unconsumed in the socket, so the close
+# that follows the reply is a reset rather than an orderly one.  The reply is
+# therefore all that is asserted here; the mainlog carries the rest, and shows
+# the same lost-connection record and no acceptance.
+#
+client-anytls 127.0.0.1 PORT_D
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+STARTTLS
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250 HELP
+MAIL FROM:<someone@some.domain>
+??? 250
+RCPT TO:<CALLER@test.ex>
+??? 250
+BDAT 85 LAST
+>>> To: Susan@random.com\r\nFrom: Sam@random.com\r\n\r\nbody-start-AAAAAAAAAAAAAAAAAAAAAAAAAAA
+stoptls
+>>> X
+??? 421 Lost incoming connection
+****
+#
+# Session 3 - teardown part-way through a command line.
+#
+# No transaction is open, so nothing is being read for a message; what is
+# incomplete is the command line itself, sent without its terminator.  The rest
+# of it is then supplied in clear, along with a further command.
+#
+# Joining the two halves would be the worst of the readings available: half a
+# command carrying whatever standing the session conferred, completed by a peer
+# that no longer has it - a server that joins them answers "250 OK" to the address
+# so assembled.  The input is finished instead, and the reply says so.
+#
+client-anytls 127.0.0.1 PORT_D
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+STARTTLS
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250 HELP
+>>> MAIL FROM:<someone@some.
+stoptls
+>>> domain>\r\nRCPT TO:<CALLER@test.ex>\r\n
+??? 421 testhost.test.ex lost input connection
+???*
+****
+#
+# Session 4 - teardown between commands, which is the one position at which the
+# connection carries on.
+#
+# Nothing is in flight, so there is nothing to truncate and the remains of the
+# connection are handed to a plain dialogue - which is what an Exim client asking
+# for no TLS proxy does, and what test 1157 requires of this server.  Carrying on
+# is not the same as carrying anything over, and that is what is asserted here:
+# the socket now answers only what RFC 3207 section 4 leaves a server requiring
+# TLS able to answer, and refuses everything else with the 530 it prescribes.
+#
+# A transaction, an address lookup and an offer of credentials are each refused,
+# which between them cover accepting a message, exposing an address and
+# authenticating - the three things the ended session could otherwise have been
+# spent on.  Three refusals is also the most that can be asserted in one session,
+# since a fourth passes smtp_max_synprot_errors and the connection is dropped.
+#
+# A fresh greeting is then answered, and its extension set is asserted in full:
+# STARTTLS is offered again, which is both the proof that the state behind the
+# advertisement was recomputed rather than remembered and the handoff that test
+# 1157 depends on.  Answering it is where this session stops: the harness client
+# cannot start a second session once it has stopped the first, because stoptls
+# takes the library's global state down with it (src/client.c), and it offers no
+# way to choose a protocol version or a server name for a session either.  So the
+# second handshake itself is left to test 1157, which drives that sequence from an
+# Exim client, and a successor session differing from its predecessor in version
+# or server name is not expressible in this harness at all.
+#
+client-anytls 127.0.0.1 PORT_D
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+STARTTLS
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250 HELP
+stoptls
+MAIL FROM:<someone@some.domain>
+??? 530 Must issue a STARTTLS command first
+VRFY postmaster
+??? 530 Must issue a STARTTLS command first
+AUTH PLAIN
+??? 530 Must issue a STARTTLS command first
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+QUIT
+??? 221
 ****
 millisleep 500
 killdaemon

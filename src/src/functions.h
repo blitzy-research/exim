@@ -545,7 +545,7 @@ extern void    smtp_send_prohibition_message(int, uschar *);
 extern int     smtp_setup_msg(void);
 extern int     smtp_sock_connect(smtp_connect_args *, int, const blob *);
 extern BOOL    smtp_start_session(void);
-extern void    smtp_tls_session_ended(void);
+extern BOOL    smtp_tls_session_ended(void);
 extern int     smtp_ungetc(int);
 extern void    smtp_verify_feed(const uschar *, unsigned);
 extern BOOL    smtp_verify_helo(void);

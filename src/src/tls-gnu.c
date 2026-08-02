@@ -216,6 +216,9 @@ typedef struct exim_gnutls_state {
   BOOL			have_set_peerdn:1;
   BOOL			xfer_eof:1;
   BOOL			xfer_error:1;
+  BOOL			xfer_handover:1;	/* teardown handed the socket on
+						in clear; only then may a
+						reader fall back to it */
 #ifdef SUPPORT_CORK
   BOOL			corked:1;
 #endif
@@ -2218,6 +2221,44 @@ else
 
   DEBUG(D_tls) debug_printf("initialising GnuTLS server session\n");
 
+  /* That re-use is why everything a session owns has to be dropped here, this
+  being the one point every server session passes through: the context is never
+  re-zeroed after process start (the template copy above is client-only), so
+  anything left set by a predecessor would be presented as belonging to the
+  session about to start.  What is dropped is state a session owns; the
+  credential cache in lib_state, and the expansions that pair with it, are
+  deliberately kept - that is what makes them a cache.
+
+  Each of these is only ever set, or is only assigned on some of its paths, so
+  none of them is corrected by the session that follows:
+  . the SNI the peer sent, and the record of whether it drives file expansion,
+    are set from the handshake callback and never cleared, so a successor
+    without SNI would report and log its predecessor's;
+  . the peer's certificate, its DN and the cipher suite are recorded only when
+    there is something to record, and the "already recorded" latch suppresses
+    even that;
+  . the two verification results are assigned only on the paths that verify, so
+    a successor not asking for verification would report its predecessor's;
+  . the channel-binding type decides which binding an authenticator is told it
+    has, so a TLS 1.3 session followed by an earlier-version one would have
+    TLS-UNIQUE data labelled as TLS-EXPORTER;
+  . likewise the extended-master-secret record, which is only ever set. */
+
+  state->received_sni = NULL;
+  state->trigger_sni_changes = FALSE;
+  state->have_set_peerdn = FALSE;
+  state->peercert = NULL;
+  state->peerdn = NULL;
+  state->ciphersuite = NULL;
+  state->peer_cert_verified = state->peer_dane_verified = FALSE;
+#ifdef SUPPORT_CORK
+  state->corked = FALSE;
+#endif
+  tlsp->sni = NULL;
+  tlsp->peercert = NULL;
+  tlsp->ext_master_secret = FALSE;
+  tlsp->channelbind_exporter = FALSE;
+
 #ifdef EXIM_TLS_EARLY_BANNER
   if (state->early_banner)
     {
@@ -3307,11 +3348,12 @@ state->xfer_buffer = store_malloc(ssl_xfer_buffer_size);
 /* The one server context is re-used for successive TLS sessions on a single
 TCP connection (see the comment in tls_init()), and it is never re-zeroed after
 process start.  Initialise the receive state that goes with this buffer, so
-that a session cannot inherit the water marks or the end-of-file and error
-latches left behind by its predecessor's teardown. */
+that a session cannot inherit the water marks, the end-of-file and error
+latches, or the hand-on record left behind by its predecessor's teardown. */
 
 state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
 state->xfer_eof = state->xfer_error = FALSE;
+state->xfer_handover = FALSE;
 
 #ifdef EXIM_TLS_EARLY_BANNER
 if (  gnutls_protocol_get_version(state->session) > GNUTLS_TLS1_2
@@ -3328,10 +3370,32 @@ if (  gnutls_protocol_get_version(state->session) > GNUTLS_TLS1_2
   the read timed out.  tls_refill() tears the session down in the first case, so
   nothing below - the flag query, the resumption bookkeeping, the debug of the
   peer, the expansion variables - may touch it.  Report a failed handshake, and
-  send no alert: there may be no session left to send one on. */
+  send no alert: there may be no session left to send one on.
+
+  Release the session and the buffer here rather than leaving that to teardown.
+  This is still ahead of the point at which the session is registered as the
+  active one for the connection (extract_exim_vars_from_tls_state() below), and
+  tls_close() returns at its entry guard while it is unregistered - so neither
+  the teardown tls_refill() attempts on the peer-went-away path nor any later
+  one releases anything, and both objects would be held until the process
+  ended.  Release what is still here rather than assuming which way the wait
+  failed, and null the pointers, so that this cannot become a double release. */
 
   if (!tls_refill(GETC_BUFFER_UNLIMITED))
     {
+    if (state->session)
+      {
+      gnutls_deinit(state->session);
+      state->session = NULL;
+      }
+    if (state->xfer_buffer)
+      {
+      store_free(state->xfer_buffer);
+      state->xfer_buffer = NULL;
+      }
+    state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
+    state->xfer_eof = state->xfer_error = TRUE;
+
     (void) tls_error(US"handshake",
 	      US"session ended before the handshake completed", NULL, errstr);
     return FAIL;
@@ -4037,7 +4101,12 @@ if (!ct_ctx)	/* server */
   reinstate the session readers as the top-level ones - and it does that before
   the session and the transfer buffer they read through are freed just below.
   Whether anything more may be read from the socket is its decision, and it is
-  taken once, here, for every way a server-side session can end. */
+  taken once, here, for every way a server-side session can end.
+
+  Keep the answer.  A reader of this session that is still to discover the
+  session has gone may only fall back to the plain socket where that decision was
+  to hand the connection on in clear; on every other path this input is finished
+  and the reader has to say so. */
 
   receive_getc =	smtp_getc;
   receive_getbuf =	smtp_getbuf;
@@ -4047,7 +4116,7 @@ if (!ct_ctx)	/* server */
   receive_feof =	smtp_feof;
   receive_ferror =	smtp_ferror;
 
-  smtp_tls_session_ended();
+  state->xfer_handover = smtp_tls_session_ended();
   }
 
 if (state->session)
@@ -4124,20 +4193,17 @@ clear as if it were a continuation of the encrypted session. */
 
 if (!state->session || !state->xfer_buffer) return EOF;
 
-/* A refill that failed is the end of what this reader owns.  Which reader owns
-what is left of the connection depends on why it failed, and the session pointer
-says which case this is.  If the session is gone, tls_refill() tore it down
-because the peer ended it, and tls_close() has both installed the plain readers
-and settled whether the socket may be read at all - so hand the read on: that
-yields end-of-file for a retired input, and reads the socket only where the
-teardown explicitly downgraded the connection to plain.  If the session is still
-here, the failure was a read timeout or a library error with the session intact;
-there is no downgrade to speak of and nothing else owns this read, so fail closed
-rather than take the socket underneath in clear. */
+/* A refill that failed is the end of what this reader owns, and only one outcome
+of a teardown hands what is left of the connection to anybody else: the explicit
+downgrade to a plain dialogue, which tls_close() records for exactly this
+question.  Where it was taken, the plain readers are installed and the socket is
+theirs, so hand the read on.  Otherwise - a retired input, or a read timeout or
+library error with the session still intact - nothing owns this read, and it ends
+here rather than being taken from the socket underneath in clear. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(lim))
-    return state->session ? EOF : smtp_getc(lim);
+    return state->xfer_handover ? smtp_getc(lim) : EOF;
 
 /* Something in the buffer; return next uschar */
 
@@ -4167,21 +4233,17 @@ if (!state->session || !state->xfer_buffer)
   return NULL;
   }
 
-/* As in tls_getc() above: a failed refill ends what this reader owns, and the
-session pointer says who owns the rest.  Gone means the peer ended the session and
-tls_close() settled what may still be read, so hand the read on; still here means
-a timeout or library error with the session intact, so report nothing available
-rather than take the socket underneath in clear. */
+/* As in tls_getc() above: a failed refill ends what this reader owns, and only an
+explicit downgrade to a plain dialogue hands the rest of the connection to the
+plain readers.  Where that was the outcome, hand the read on; otherwise report
+nothing available rather than take the socket underneath in clear. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(*len))
     {
-    if (state->session)
-      {
-      *len = 0;
-      return NULL;
-      }
-    return smtp_getbuf(len);
+    if (state->xfer_handover) return smtp_getbuf(len);
+    *len = 0;
+    return NULL;
     }
 
 if ((size = state->xfer_buffer_hwm - state->xfer_buffer_lwm) > *len)
@@ -4588,11 +4650,13 @@ side is left fail-closed, having nothing left to read from. */
 
 state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
 state->xfer_eof = state->xfer_error = FALSE;
+state->xfer_handover = FALSE;
 
 state_server.session = NULL;
 state_server.xfer_buffer = NULL;
 state_server.xfer_buffer_lwm = state_server.xfer_buffer_hwm = 0;
 state_server.xfer_eof = state_server.xfer_error = TRUE;
+state_server.xfer_handover = FALSE;
 
 tls_out = tls_in;
 tls_out.active.sock = newfd;
@@ -4635,6 +4699,7 @@ leave the inbound context as its only owner. */
 
 state_server.xfer_buffer_lwm = state_server.xfer_buffer_hwm = 0;
 state_server.xfer_eof = state_server.xfer_error = FALSE;
+state_server.xfer_handover = FALSE;
 
 ostate->session = NULL;
 

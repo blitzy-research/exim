@@ -561,29 +561,38 @@ in flight:
   and it continues only so far as starting that successor session, or ending the
   connection.  So drop everything the session conferred before letting it proceed
   - the authentication it carried, every TLS-derived attribute of the connection,
-  and the extension and pipelining state that the EHLO inside the session
-  established - leaving the state a plain connection starts with (compare the
-  initialisation in smtp_start_session()).  The peer must then give a fresh
-  HELO/EHLO, and a fresh STARTTLS if it wants encryption again, exactly as on a
-  new connection.  And the record kept in smtp_tls_ended refuses any later
-  attempt to submit a message, or credentials, in clear on this socket - see MAIL
-  and AUTH in smtp_setup_msg(), which answer such an attempt with the 530 that
-  RFC 3207 section 4 prescribes for a server requiring TLS.  Otherwise a peer
-  could shut the session down and carry on in clear while still presenting as
-  authenticated and encrypted, having a message accepted on a connection it
-  negotiated encryption for, or offering credentials with nothing protecting
-  them.
+  the connection-scope ACL variables that hold decisions taken under it, and the
+  extension and pipelining state that the EHLO inside the session established -
+  leaving the state a plain connection starts with (compare the initialisation in
+  smtp_start_session()).  The peer must then give a fresh HELO/EHLO, and a fresh
+  STARTTLS if it wants encryption again, exactly as on a new connection.  And the
+  record kept in smtp_tls_ended narrows what the socket will answer at all: while
+  it stands, smtp_setup_msg() refuses every command outside the set RFC 3207
+  section 4 permits a server requiring TLS to answer - HELO/EHLO, STARTTLS, QUIT
+  and NOOP - with the 530 that section prescribes, and does so ahead of the
+  command handlers so that nothing else runs.  Otherwise a peer could shut the
+  session down and carry on in clear while still presenting as authenticated and
+  encrypted, having a message accepted on a connection it negotiated encryption
+  for, offering credentials with nothing protecting them, or exercising the
+  address-exposing and queue-triggering commands under the identity the session
+  conferred.
+
+The answer also tells the caller which outcome was taken, because the reader that
+is about to find its session gone has to know whether anything owns the rest of
+the connection: only an explicit downgrade hands the socket to the plain readers,
+and on every other path the input is finished.
 
 Arguments:  none
-Returns:    nothing
+Returns:    TRUE  if the connection was explicitly downgraded to a plain dialogue
+	    FALSE if the input was retired and nothing further may be read
 */
 
-void
+BOOL
 smtp_tls_session_ended(void)
 {
 /* A session has ended on this connection.  Whatever is decided below about what
-may still be read, nothing may be submitted in clear from here on: only another
-session can lift that. */
+may still be read, from here on the connection is one that requires TLS and has
+not got it, and is answered as such; only another session lifts that. */
 
 smtp_tls_ended = TRUE;
 
@@ -601,17 +610,18 @@ if (  !fl.in_cmd_read
   DEBUG(D_tls)
     debug_printf("TLS session ended: retiring SMTP input on this connection\n");
   smtp_input_retire();
-  return;
+  return FALSE;
   }
 
 DEBUG(D_tls)
   debug_printf("TLS session ended at a command boundary: "
     "continuing in clear, dropping session state\n");
 
-/* Authentication accepted inside the session does not survive it.  The STARTTLS
-handler below clears the first three when a session starts, and
-smtp_start_session() clears these same four when a connection starts, both for
-the same reason. */
+/* Authentication accepted inside the session does not survive it.  All four are
+dropped, which is the union of the two places that already drop them for the same
+reason: the STARTTLS handler below clears the first three when a session starts,
+and smtp_start_session() clears the first two and the last when a connection
+starts. */
 
 sender_host_auth_pubname = sender_host_authenticated = NULL;
 authenticated_id = NULL;
@@ -632,8 +642,13 @@ fl.smtputf8_advertised = FALSE;
 #endif
 f.smtp_in_pipelining_advertised = FALSE;
 sync_cmd_limit = NON_SYNC_CMD_NON_PIPELINING;
+
+/* Withdrawing the offer is all that is needed to stop a stale CHUNKING
+advertisement being acted on: the next smtp_setup_msg() derives chunking_state
+from this flag, as it does on every message, so the state machine keeps its own
+transitions and gains no new one here. */
+
 f.chunking_offered = FALSE;
-chunking_state = CHUNKING_NOT_OFFERED;
 
 #ifndef DISABLE_TLS
 fl.tls_advertised = FALSE;
@@ -641,7 +656,11 @@ fl.tls_advertised = FALSE;
 /* Nothing the session said about the peer or the cipher survives either: these
 feed the ACL condition tests, the expansion variables and the log lines for
 whatever is taken next, and what is taken next arrives in clear.  tls_close()
-clears the active socket and context, and the channel binding, around this. */
+clears the active socket and context, and the channel binding, around this.  That
+accounts for every member of tls_support except those only ever used for a client
+connection - the resumption lookup key and its accumulator, the resumable-host and
+ticket-received records, and the QUIT record - which the server side of a
+connection neither sets nor reads. */
 
 tls_in.ver = tls_in.cipher = NULL;
 tls_in.cipher_stdname = NULL;
@@ -651,6 +670,7 @@ tls_in.bits = 0;
 tls_in.certificate_verified = FALSE;
 tls_in.verify_override = FALSE;
 tls_in.ext_master_secret = FALSE;
+tls_in.channelbind_exporter = FALSE;
 tls_in.ocsp = OCSP_NOT_REQ;
 tls_in.on_connect = FALSE;
 # ifdef SUPPORT_DANE
@@ -662,38 +682,99 @@ tls_in.resumption = 0;
 # endif
 #endif
 
+/* A connection-scope ACL variable can hold anything an ACL decided while the
+session stood - that the peer was authenticated, that its certificate was
+acceptable, a rate-limit or greylisting verdict reached under that identity.  None
+of it applies to a plain dialogue with a peer that has yet to greet us again, so
+drop the lot, as the start of a connection does. */
+
+acl_var_c = NULL;
+
 /* With no greeting and no session, the protocol recorded for anything taken from
 here on is the one a plain connection starts with; EHLO, AUTH and STARTTLS each
 recompute it as they are accepted. */
 
 received_protocol =
   (sender_host_address ? protocols : protocols_local) [pnormal];
+
+return TRUE;
 }
 
 
 
 /*************************************************
-*   Is submission in clear refused on this conn? *
+*  Is the connection in clear after a session?   *
 *************************************************/
 
 /* True once a server-side TLS session has ended on this connection and no
 successor one has started, so that the socket is in clear again.  What the ended
 session conferred was dropped when it went (see smtp_tls_session_ended() above),
-and nothing may be submitted on the socket until another session is negotiated:
-a message would otherwise be accepted on a connection the peer negotiated
-encryption for, and credentials would be offered with nothing protecting them.
-The shutdown-and-reinitialise handoff is unaffected, since it exists to start
-that successor session; the callers answer anything else with the 530 that RFC
-3207 section 4 prescribes for a server requiring TLS.
+and while this stands the connection is treated as one that requires TLS and has
+not got it.
 
 Arguments:  none
-Returns:    TRUE if a submission command must be refused
+Returns:    TRUE if the socket is in clear after a session ended on it
 */
 
 static BOOL
 smtp_in_clear_after_tls(void)
 {
 return smtp_tls_ended && tls_in.active.sock < 0;
+}
+
+
+
+/*************************************************
+* May this command be answered with no session?  *
+*************************************************/
+
+/* Which commands a connection in the state above will answer at all.  RFC 3207
+section 4 has a server that requires TLS answer 530 to every command other than
+NOOP, EHLO, STARTTLS and QUIT, and that is what this permits, with HELO alongside
+EHLO because it is the same command in its unextended form and this server treats
+the pair as one throughout.  Between them they are exactly what the
+shutdown-and-reinitialise handoff needs - a greeting and a fresh STARTTLS - and
+they confer nothing: the greeting handlers recompute the connection state from
+scratch, NOOP only answers, and QUIT ends the connection.
+
+Deciding by exception, so that a command added later is refused until it is
+considered, is deliberate.
+
+The codes that are not a command the peer sent are permitted through to their own
+handlers: end of input, an unrecognized or malformed command, the too-many-nonmail
+limit, and the proxy-failure code.  Each of those either ends the connection or
+counts towards a limit that ends it, and answering them with a 530 instead would
+bypass that and let a peer hold the connection open indefinitely.
+
+Argument:   the command code from smtp_read_command()
+Returns:    TRUE if the command may be handled, FALSE if it must be refused
+*/
+
+static BOOL
+smtp_cmd_permitted_in_clear(int cmd)
+{
+switch (cmd)
+  {
+  case HELO_CMD:
+  case EHLO_CMD:
+  case STARTTLS_CMD:
+  case NOOP_CMD:
+  case QUIT_CMD:
+
+  case EOF_CMD:
+  case OTHER_CMD:
+  case BADARG_CMD:
+  case BADCHAR_CMD:
+  case BADSYN_CMD:
+  case TOO_MANY_NONMAIL_CMD:
+#ifdef SUPPORT_PROXY
+  case PROXY_FAIL_IGNORE_CMD:
+#endif
+    return TRUE;
+
+  default:
+    return FALSE;
+  }
 }
 
 
@@ -4178,7 +4259,7 @@ while (done <= 0)
   void (*oldsignal)(int);
   pid_t pid;
   int start, end, sender_domain, recipient_domain;
-  int rc, c, dsn_flags;
+  int rc, c, dsn_flags, cmd;
   uschar * orcpt = NULL;
   gstring * g;
 
@@ -4226,13 +4307,32 @@ while (done <= 0)
     }
 #endif
 
-  switch(smtp_read_command(
+  cmd = smtp_read_command(
 #ifndef DISABLE_PIPE_CONNECT
 	  !fl.pipe_connect_acceptable,
 #else
 	  TRUE,
 #endif
-	  GETC_BUFFER_UNLIMITED))
+	  GETC_BUFFER_UNLIMITED);
+
+  /* A TLS session has ended on this connection and no successor one has started,
+  so the socket is in clear.  Answer only what RFC 3207 section 4 permits a server
+  requiring TLS to answer, and refuse the rest with the 530 that section
+  prescribes - here, ahead of every handler, so that a refused command has no
+  effect at all: it starts no transaction, counts towards no per-message limit,
+  runs no ACL, and cannot act on state the ended session conferred.  The refusal
+  is logged with the command as sent, and counts towards smtp_max_synprot_errors,
+  so a peer that keeps trying is disconnected as any other protocol error would
+  have it. */
+
+  if (smtp_in_clear_after_tls() && !smtp_cmd_permitted_in_clear(cmd))
+    {
+    done = synprot_error(L_smtp_protocol_error, 530, NULL,
+      US"Must issue a STARTTLS command first");
+    goto COMMAND_LOOP;
+    }
+
+  switch(cmd)
     {
     /* The AUTH command is not permitted to occur inside a transaction, and may
     occur successfully only once per connection. Actually, that isn't quite
@@ -4260,15 +4360,6 @@ while (done <= 0)
 	break;
 	}
 
-      /* Nor may credentials be offered in clear on a connection whose TLS
-      session has gone, whatever this authenticator advertises. */
-
-      if (smtp_in_clear_after_tls())
-	{
-	done = synprot_error(L_smtp_protocol_error, 530, NULL,
-	  US"Must issue a STARTTLS command first");
-	break;
-	}
       if (sender_host_authenticated)
 	{
 	done = synprot_error(L_smtp_protocol_error, 503, NULL,
@@ -4872,16 +4963,6 @@ while (done <= 0)
       message_start();
       was_rej_mail = TRUE;               /* Reset if accepted */
       env_mail_type_t * mail_args;       /* Sanity check & validate args */
-
-      /* No message may be taken in clear on a connection whose TLS session has
-      gone; a successor session has to be started first. */
-
-      if (smtp_in_clear_after_tls())
-	{
-	done = synprot_error(L_smtp_protocol_error, 530, NULL,
-	  US"Must issue a STARTTLS command first");
-	break;
-	}
 
       if (!fl.helo_seen)
 	if (  fl.helo_verify_required
