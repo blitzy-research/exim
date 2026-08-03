@@ -132,6 +132,20 @@ Buffer, session handle and the callbacks on both are given one joint lifetime.
     on its own would not have covered this, standing at "offered" between one
     chunk and the next and never above it for a message sent with DATA.
 
+-   Where something is still owed, the end-of-file and error channel is also
+    left reporting the session that ended, rather than following the other
+    readers to the plain socket. Message reading consults that channel to tell
+    a connection lost mid-message from one that ended properly, and it has to,
+    because an end of file arriving where the next header line could have begun
+    - or could have been a folded continuation of the line just read - is
+    otherwise indistinguishable from a message whose last header ended it. A
+    channel answering for a socket which is still open and has had no end of
+    file of its own reports nothing, and the unfinished message would be
+    accepted, and acknowledged, with none of the body it declared - so the peer
+    is told it arrived and never sends it again. Where nothing is owed the
+    connection carries on and the channel follows it to the plain socket, whose
+    end of file is then the one that matters.
+
 -   A session that ended with no message in progress is left as before, its
     connection picked up in clear, that being how such a session is handed on -
     Exim's own smtp transport ends one that way and continues the dialogue. So
@@ -225,6 +239,15 @@ clear, has nothing to read there, and answers only when the receive timeout
 expires - with a 421 of its own, which a loose match would accept, and which is
 what that tree produces. No run emitted a double-push or double-pop diagnostic.
 
+A second witness covers the case one byte away from that one, where the header
+line is finished before the session goes. That single byte changes which part of
+the reading code sees the end of the session, and it is the case that can be got
+wrong in the more damaging direction: read as the end of a message, an
+unfinished one is accepted and acknowledged with none of its body. Both ways of
+sending a message reach it, so the witness exercises the chunked path and the
+default one alike, each having to answer that the connection was lost and then
+be at end of file, with nothing accepted.
+
 The regression witnesses behave as before, byte for byte: chunked reception and
 transmission with and without TLS, the state-transplant paths, signature
 verification, early pipelining, per-recipient data, and the multi-message
@@ -238,10 +261,10 @@ Four properties of the suite and of the environment it runs in are recorded
 here, none of them caused by this change and all of them reproducible on the
 unremediated tree, so that none is misread as a regression.
 
-The reproducer needs the daemon under test to be the GnuTLS build, so that
+Both witnesses need the daemon under test to be the GnuTLS build, so that
 binary is handed to the harness with the cross-library option left off:
 
-    cd test && ./runtest <gnutls-binary> --continue --test 2038
+    cd test && ./runtest <gnutls-binary> --continue --test 2038 --test 2039
 
 Given that option the harness pairs the two library-specific builds against each
 other, leaving the OpenSSL build answering as the server - a build in which the

@@ -4090,6 +4090,7 @@ tls_close(void * ct_ctx, int do_shutdown)
 {
 exim_gnutls_state_st * state = ct_ctx ? ct_ctx : &state_server;
 tls_support * tlsp = state->tlsp;
+BOOL owed;
 
 if (!tlsp || tlsp->active.sock < 0) return;  /* TLS was not active */
 
@@ -4126,6 +4127,26 @@ if (do_shutdown && state->session)
   ALARM_CLR(0);
   }
 
+/* Is anything still owed to a message being received?  A chunk with data
+outstanding, or a transaction that has reached its sender or a recipient, means
+the session is ending in the middle of a message: what arrives next is not what
+was promised, so the message must not be treated as one the peer finished
+sending.  A chunk count alone does not cover that, being back at
+CHUNKING_OFFERED between one chunk and the next and never above it for a message
+sent with DATA.
+
+A session that ends with no message in progress owes nothing, and its connection
+is meant to be picked up in clear - Exim's own smtp transport ends one that way
+and continues the dialogue on the same connection.  The sender and recipient
+count are cleared as each message finishes and by RSET, before the next command
+is read, so a connection reused that way is unaffected.
+
+Taken once, here, and used for both of the decisions that follow from it - which
+end-of-file channel the connection is left with, and whether the read routines
+are latched against reading on - so the two cannot come to disagree. */
+
+owed = chunking_state > CHUNKING_OFFERED || sender_address || rcpt_count > 0;
+
 if (!ct_ctx)	/* server */
   {
   /* Point the top-level readers back at the plain socket, and take the readers a
@@ -4141,8 +4162,33 @@ if (!ct_ctx)	/* server */
   receive_get_cache =	smtp_get_cache;
   receive_hasc =	smtp_hasc;
   receive_ungetc =	smtp_ungetc;
-  receive_feof =	smtp_feof;
-  receive_ferror =	smtp_ferror;
+
+  /* The end-of-file and error channel is the exception.  A reader which stops
+  because the session went is expected to say so through it: the message-reading
+  code reads that channel to tell a connection which went away in the middle of a
+  message from one which ended properly, and an end of file arriving where a
+  header line could have been folded is otherwise indistinguishable from the end
+  of a message.  Handing that channel to the plain socket instead reports on a
+  socket which is still open and has had no end of file of its own, which is to
+  say it reports nothing, and a message the peer never finished sending would be
+  accepted as complete.  So where something is still owed, leave the channel
+  reporting the session that ended - the flags it reads are the ones latched
+  below, and neither the buffer nor the session is touched to read them.
+
+  With nothing owed the connection carries on, and the channel has to follow it
+  to the plain socket: it is that socket's end of file, not the ended session's,
+  which then matters. */
+
+  if (owed)
+    {
+    receive_feof =	tls_feof;
+    receive_ferror =	tls_ferror;
+    }
+  else
+    {
+    receive_feof =	smtp_feof;
+    receive_ferror =	smtp_ferror;
+    }
 
   bdat_invalidate_receive_functions();
   }
@@ -4183,26 +4229,18 @@ state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
 /* The session is over: record its end of file, which is what tls_feof() reports.
 
 The error latch is what keeps the read routines below from taking the rest of a
-message from the socket in clear.  Latch it whenever anything is still owed to
-the message being received: a chunk with data outstanding, or a transaction that
-has reached its sender or a recipient.  The bytes arriving next are not the ones
-that were promised, and taking them would splice what the peer sends in clear
-into a message it began under encryption - and a chunk count alone does not
-cover that, being back at CHUNKING_OFFERED between one chunk and the next and
-never above it for a message sent with DATA.
-
-A session that ends with no message in progress has nothing outstanding, and its
-connection is meant to be picked up in clear - Exim's own smtp transport ends one
-that way and continues the dialogue on the same connection - so leave that case
-alone.  The sender and recipient count are cleared as each message finishes and
-by RSET, before the next command is read, so a connection reused that way is
-unaffected.
+message from the socket in clear: the bytes arriving next are not the ones that
+were promised, and taking them would splice what the peer sends in clear into a
+message it began under encryption.  It is latched on the same "still owed" test
+that chose the end-of-file channel above, so a session which ends in the middle
+of a message reports its end through both, and one which ends between messages
+through neither.
 
 A context that is given a buffer of its own clears both flags at the allocation
 site, so a later session on this connection inherits neither latch. */
 
 state->xfer_eof = TRUE;
-if (chunking_state > CHUNKING_OFFERED || sender_address || rcpt_count > 0)
+if (owed)
   state->xfer_error = TRUE;
 }
 

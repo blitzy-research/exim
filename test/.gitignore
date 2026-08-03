@@ -10,11 +10,13 @@ spool/
 test-*
 failed-summary.log
 run-summary.log
-# Two files the harness itself produces in this directory and which must not be
+# Three things the harness itself produces in this directory and which must not be
 # committed.  trusted_configs is the TRUSTED_CONFIG_LIST the build is pointed at,
 # whose location test/README recommends be exactly here; it holds an absolute path
 # to the checkout it was generated in.  missingfile is created by test 2600, which
 # asks for a lookup against a deliberately absent database file named in this
-# directory.
+# directory.  tmp/ is a second spool directory, named by test 0910's configuration,
+# and holds spool files just as spool/ above does.
 trusted_configs
 missingfile
+tmp/

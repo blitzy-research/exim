@@ -86,8 +86,11 @@ JH/21 Fix a use-after-free in the GnuTLS transfer buffer.  A TLS session shut
       saved by the chunked-body layer.  Those readers are now taken off the
       released objects, both pointers are cleared as they are released, and the
       routines reading through either fail closed.  A session lost while a
-      message is being received ends it rather than taking the rest in clear.
-      A session ending with no message in progress leaves the connection to
+      message is being received ends it rather than taking the rest in clear,
+      and its end of file is reported through the channel message reading
+      consults, so an unfinished message is refused with a lost-connection
+      response instead of being accepted without the body it declared.  A
+      session ending with no message in progress leaves the connection to
       carry on as it did before, which the smtp transport relies on where
       hosts_noproxy_tls matches.
 
