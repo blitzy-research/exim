@@ -7,70 +7,50 @@ Content-Type: text/plain; charset=utf-8
 
 Dear Exim users,
 
-we have identified, by code inspection, a heap use-after-free in the
-GnuTLS-backed SMTP server. A TLS session torn down while a chunked body
-transfer (BDAT, from the CHUNKING extension) is still in progress releases the
-transfer buffer and destroys the session while the reader callbacks bound to
-them stay installed and keep being dispatched.
+we have identified, by code inspection, a memory-safety defect in the
+GnuTLS-backed SMTP server: a TLS session torn down mid-transfer of a chunked
+body (BDAT, from the CHUNKING extension) frees the transfer buffer and destroys
+the session, while the readers bound to both stay installed and dispatched.
 
-A remote, unauthenticated attacker can reach it on a stock build and
-configuration, CHUNKING and STARTTLS both being advertised by default, by
-ending a TLS session mid-chunk with the socket left open. The consequence is
-heap corruption - attacker-supplied bytes decoded into a freed allocation -
-and we have not developed an exploit chain beyond that. A use-after-free read,
-an expired-pointer dereference and a silent continuation in clear are
-reachable alongside it.
+A remote, unauthenticated attacker reaches this on a stock build - CHUNKING and
+STARTTLS are advertised by default - by ending a session mid-chunk with the
+socket left open; the result is heap corruption, attacker-supplied bytes being
+decoded into a freed allocation.
 
-Affected: builds using the GnuTLS backend - the 4.100 development tree and all
-preceding releases that shipped that backend with CHUNKING support, which we
-cannot narrow further. OpenSSL builds are affected differently and far less
-severely; no OpenSSL backend source is edited here.
+Affected are GnuTLS-backend builds: the 4.100 development tree and all
+preceding releases that shipped that backend with CHUNKING support - a bound we
+cannot narrow, the earliest affected release not being establishable from the
+source tree alone. OpenSSL builds never release the buffer and so have no
+use-after-free; the crash their equivalent path yields is closed with it.
 
-Remediation is prepared. Buffer, session handle and the callbacks operating on
-both are given a single, jointly enforced lifetime. What a server session
-records in its own context - the server name the peer sent, the peer's
-certificate and ours, the peer DN, the cipher-suite string, the verification
-results and the channel-binding type - is cleared as each session's state is
-set up and before its handshake; the two certificates are library objects that
-context owns, and are released there, exactly once each. What a finished
-session reported stays readable until the next one begins, the expansion
-variables and the logging of an accepted message depending on that. The change
-is confined to the TLS transfer-buffer lifetime logic and the chunked-body
-handling. No public API or ABI, SMTP wire protocol, spool format,
-configuration option or default, or chunking_state_t transition changes.
+The remediation gives the buffer, the session handle and the readers working
+through them one jointly enforced lifetime: both pointers are cleared as they
+are released, the saved chunked-body readers are re-pointed at the plain ones,
+transfer state is reset wherever a session is given a buffer, and each routine
+reading through either object fails closed. No API, ABI, wire protocol, spool
+format, option, default or chunking-state transition changes.
 
-Two changes are visible to operators. A server session that ends now ends the
-input on its connection: nothing further is read from that socket in clear and
-a message in progress fails, wherever the session ended - in a transaction, a
-body transfer, an authentication exchange, a part-read command line, between
-commands - though a terminal 421 still goes out, in clear, before the close. A
-connection on which no session ever came up is left alone, so a handshake that
-failed is answered as before. And a peer that ends a session meaning to go on
-using the socket is answered with end of file: the smtp transport's
-hosts_noproxy_tls handoff is such a peer, so its next message is delivered on a
-connection of its own rather than a handed-on one - none is lost, deferred or
-duplicated, and what changes is the re-use, visible in a log as a connection
-per message.
+One change is visible to operators: a session lost while a chunk is still owed
+data now ends the message - the read path fails closed, no further command is
+accepted, and the remainder is no longer read from the socket in clear. A
+terminal failure response does still go out in clear; a session ending between
+commands is unaffected.
 
-One workaround exists, as a compensating control rather than a fix:
-restricting chunking_advertise_hosts so CHUNKING is not advertised removes the
-trigger, at the cost of a standards-defined SMTP capability. On our handling
-of security releases and vendor backports see
-<https://wiki.exim.org/EximSecurity> and
-<https://wiki.exim.org/SecurityReleaseProcess>.
+The one workaround is a compensating control, not a fix: restricting
+chunking_advertise_hosts so CHUNKING is not advertised removes the trigger, at
+the cost of a standards-defined SMTP capability, and needs an explicit
+configuration action, the option defaulting to "*". For our handling of
+security releases and vendor backports see <https://wiki.exim.org/EximSecurity>
+and <https://wiki.exim.org/SecurityReleaseProcess>.
 
-No public identifier is asserted: we claim no CVE identifier and no advisory
-reference, none having been retrievable when this was written. Any identifier
-found elsewhere in the Exim source tree belongs to a different, historical
-issue. This notice carries no sender, date or transport metadata; none is
-invented here. The full technical report and the disclosure chronology are the
-report.txt and timeline files alongside it.
+No public identifier and no severity score are asserted: our assessment is
+code-derived and externally unverified, and no public record was retrievable.
+Identifiers found elsewhere in the tree are other, historical issues.
 
-2026-07-31: identified by code inspection
+2026-07-31: we identified the defect by code inspection
 2026-07-31: remediation prepared
 2026-08-02: remediation reviewed, revised and verified
-planned:
-2026-08-04 15:00UTC: publish the fix via the distros repo (distro packagers)
-2026-08-07 15:00UTC: publish the fix via the default repo (the public)
+~2026-08-04: publish the fix via the distros repo (for the distro packagers)
+~2026-08-07: publish the fix via the default repo (for the public)
 
     The Exim maintainers

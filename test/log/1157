@@ -26,9 +26,9 @@
 1999-03-02 09:44:33 Start queue run: pid=p1236 -qqf
 1999-03-02 09:44:33 10HmbJ-000000005vi-0000 => user_p@test.ex R=client T=send_to_server H=127.0.0.1 [127.0.0.1] X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx CV=yes C="250 OK id=10HmbM-000000005vi-0000"
 1999-03-02 09:44:33 10HmbJ-000000005vi-0000 Completed
-1999-03-02 09:44:33 10HmbK-000000005vi-0000 => user_q@test.ex R=client T=send_to_server H=127.0.0.1 [127.0.0.1] X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx CV=yes C="250 OK id=10HmbN-000000005vi-0000"
+1999-03-02 09:44:33 10HmbK-000000005vi-0000 => user_q@test.ex R=client T=send_to_server H=127.0.0.1 [127.0.0.1]* X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx CV=yes C="250 OK id=10HmbN-000000005vi-0000"
 1999-03-02 09:44:33 10HmbK-000000005vi-0000 Completed
-1999-03-02 09:44:33 10HmbL-000000005vi-0000 => user_r@test.ex R=client T=send_to_server H=127.0.0.1 [127.0.0.1] X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx CV=yes C="250 OK id=10HmbO-000000005vi-0000"
+1999-03-02 09:44:33 10HmbL-000000005vi-0000 => user_r@test.ex R=client T=send_to_server H=127.0.0.1 [127.0.0.1]* X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx CV=yes C="250 OK id=10HmbO-000000005vi-0000"
 1999-03-02 09:44:33 10HmbL-000000005vi-0000 Completed
 1999-03-02 09:44:33 End queue run: pid=p1236 -qqf
 
@@ -64,10 +64,6 @@
 1999-03-02 09:44:33 exim x.yz daemon started: pid=p1241, no queue runs, listening for SMTP on port PORT_D
 1999-03-02 09:44:33 SMTP connection from [127.0.0.1]:10003 (TCP/IP connection count = 1)
 1999-03-02 09:44:33 10HmbM-000000005vi-0000 <= CALLER@myhost.test.ex H=localhost (myhost.test.ex) [127.0.0.1]:10003 P=esmtps X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx S=sss id=E10HmbJ-000000005vi-0000@myhost.test.ex for user_p@test.ex
-1999-03-02 09:44:33 SMTP connection from localhost (myhost.test.ex) [127.0.0.1]:10003 lost D=qqs
-1999-03-02 09:44:33 SMTP connection from [127.0.0.1]:10004 (TCP/IP connection count = 1)
-1999-03-02 09:44:33 10HmbN-000000005vi-0000 <= CALLER@myhost.test.ex H=localhost (myhost.test.ex) [127.0.0.1]:10004 P=esmtps X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx S=sss id=E10HmbK-000000005vi-0000@myhost.test.ex for user_q@test.ex
-1999-03-02 09:44:33 SMTP connection from localhost (myhost.test.ex) [127.0.0.1]:10004 lost D=qqs
-1999-03-02 09:44:33 SMTP connection from [127.0.0.1]:10005 (TCP/IP connection count = 1)
-1999-03-02 09:44:33 10HmbO-000000005vi-0000 <= CALLER@myhost.test.ex H=localhost (myhost.test.ex) [127.0.0.1]:10005 P=esmtps X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx S=sss id=E10HmbL-000000005vi-0000@myhost.test.ex for user_r@test.ex
-1999-03-02 09:44:33 SMTP connection from localhost (myhost.test.ex) [127.0.0.1]:10005 D=qqs closed by QUIT
+1999-03-02 09:44:33 10HmbN-000000005vi-0000 <= CALLER@myhost.test.ex H=localhost (myhost.test.ex) [127.0.0.1]:10003 P=esmtps X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx S=sss id=E10HmbK-000000005vi-0000@myhost.test.ex for user_q@test.ex
+1999-03-02 09:44:33 10HmbO-000000005vi-0000 <= CALLER@myhost.test.ex H=localhost (myhost.test.ex) [127.0.0.1]:10003 P=esmtps X=TLS1.x:ke-RSA-AES256-SHAnnn:xxx S=sss id=E10HmbL-000000005vi-0000@myhost.test.ex for user_r@test.ex
+1999-03-02 09:44:33 SMTP connection from localhost (myhost.test.ex) [127.0.0.1]:10003 D=qqs closed by QUIT

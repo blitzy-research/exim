@@ -40,8 +40,8 @@ Succeeded in starting TLS
 >>> RCPT TO:<CALLER@test.ex>
 ??? 250
 <<< 250 Accepted
->>> BDAT 85 LAST
->>> To: Susan@random.com\r\nFrom: Sam@random.com\r\n\r\nbody-start-AAAAAAAAAAAAAAAAAAAAAAAAAAA
+>>> BDAT 88 LAST
+>>> To: Susan@random.com
 Shutting down TLS encryption
 ??? 421 Lost incoming connection
 <<< 421 Lost incoming connection

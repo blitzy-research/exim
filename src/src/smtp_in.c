@@ -349,15 +349,12 @@ static uschar *smtp_inptr;
 static uschar *smtp_inend;
 static int     smtp_had_eof;
 static int     smtp_had_error;
-static BOOL    smtp_input_retired;
-static BOOL    smtp_tls_was_active;
 
 
 /* forward declarations */
 static int smtp_read_command(BOOL check_sync, unsigned buffer_lim);
 static void smtp_quit_handler(uschar **, uschar **);
 static void smtp_rset_handler(void);
-static void bdat_invalidate_receive_functions(void);
 static inline void bdat_settle_receive_functions(void);
 
 /*************************************************
@@ -464,106 +461,8 @@ if (!(smtp_inbuffer = US malloc(IN_BUFFER_SIZE)))
   log_write_die(0, LOG_MAIN, "malloc() failed for SMTP input buffer");
 smtp_inbuffer[IN_BUFFER_SIZE-1] = '\0';
 
-/* This is where a new input source begins, and so also the one place where what
-a previous one recorded - that it was retired, and that a TLS session had become
-active on it - is dropped. */
-
 smtp_inptr = smtp_inend = smtp_inbuffer;
 smtp_had_eof = smtp_had_error = 0;
-smtp_input_retired = FALSE;
-smtp_tls_was_active = FALSE;
-}
-
-
-
-/*************************************************
-*        Retire the SMTP input on this fd        *
-*************************************************/
-
-/* Called from smtp_tls_session_ended() below when nothing further may be read
-from this connection: a TLS session on it has ended.  The socket underneath the
-session is still open, but whatever arrives on it from here on is not part of the
-session the peer negotiated encryption for; reading it would continue the
-conversation in clear, and any transaction state built up under encryption would
-carry on with it.  So there is nothing left to read: record the end of this input,
-which both stops smtp_refill() below from going back to the socket - for every
-plain reader, since they all refill through it - and lets smtp_feof(), and
-therefore the receive_feof() that teardown installs, report the end of the message
-data to a caller that is in the middle of taking a message.
-
-No read error is recorded: smtp_ferror() must stay clear, because a
-peer-initiated shutdown is not an I/O failure and the message-abandoned path in
-receive_msg() keys on that.
-
-The flag lasts as long as this input does; smtp_buf_init() clears it when a
-connection starts, so a session handed over to a fresh SMTP dialogue - as ATRN
-customer mode does - is unaffected.
-
-Arguments:  none
-Returns:    nothing
-*/
-
-static void
-smtp_input_retire(void)
-{
-smtp_input_retired = TRUE;
-smtp_had_eof = 1;
-
-/* Nothing buffered ahead of the plain readers is part of this input either.  The
-buffer is empty in practice - it is reset when a session starts and no plain
-refill happens while one is running - so this only keeps it consistent with the
-refusal recorded just above. */
-
-if (smtp_inbuffer) smtp_inptr = smtp_inend = smtp_inbuffer;
-}
-
-
-
-/*************************************************
-*   End the input after a server TLS shutdown    *
-*************************************************/
-
-/* Called from the server side of a TLS teardown, once the readers installed for
-the session have been pointed back at the plain socket and before the session
-object and its transfer buffer are released; and again from smtp_refill() above
-for a teardown that did not come through here, so that the answer does not depend
-on which TLS backend is compiled.  It is idempotent, and after the first call
-smtp_refill() returns on the retired-input test ahead of reaching it.
-
-The socket underneath is still open, so this is the point at which the remains of
-the connection have to be settled, and the answer is the same at every point of
-the conversation a session can end at: nothing further is read here.
-
-First, the saved lower-layer reader vector has to stop pointing at the session
-readers.  Resetting the top-level receive_* vector is not sufficient on its own,
-because the chunked-body readers are also called directly and their pop
-reinstalls whatever was saved - see bdat_invalidate_receive_functions() below.
-
-Then the input itself is retired.  Anything still to come is either the declared
-remainder of a chunked or dot-terminated body, a header block, an authentication
-exchange or the rest of a part-read command line - none of which may be taken in
-clear on a connection the peer negotiated encryption for, and a partly-read body
-must not reach the acceptance path as though it were complete - or it is a fresh
-command, which a peer that has just discarded the protection it asked for has to
-offer on a new connection instead.  A teardown we initiated ourselves, at QUIT or
-a protocol-error drop or process exit, lands here too, which is correct: nothing
-further is to be read on those paths either.
-
-Arguments:  none
-Returns:    nothing
-*/
-
-void
-smtp_tls_session_ended(void)
-{
-/* The chunked-body layer dispatches through the saved lower-layer vector, so
-that has to be taken off the session readers before they go. */
-
-bdat_invalidate_receive_functions();
-
-DEBUG(D_tls)
-  debug_printf("TLS session ended: retiring SMTP input on this connection\n");
-smtp_input_retire();
 }
 
 
@@ -596,42 +495,7 @@ int rc, save_errno;
 
 if (smtp_out_fd < 0 || smtp_in_fd < 0) return FALSE;
 
-/* Once the input has been retired the socket is not read again, whatever is
-sitting on it; see smtp_input_retire() above.  Every plain reader refills through
-here, so one test covers them all, and it comes before the flush below: there is
-nothing to send in response to input that is not going to be read, and anything
-already buffered goes out when the process finishes with the connection
-(exim_exit(), and the flushes around the SMTP loop in daemon.c).  Flushing a
-socket whose session has just gone would also risk recording a write error
-against a connection that is simply over.  Nothing else sets this, so a plain
-connection reaching its own end of file still takes the read below and reports it
-exactly as it always has. */
-
-if (smtp_input_retired) return FALSE;
-
-/* A TLS session became active on this connection and has since ended.  Whatever
-is on the socket now is not part of it, so reading it would continue in clear a
-conversation the peer negotiated encryption for: end the input instead.  Reaching
-here at all means the session's own teardown did not do so, which is why the test
-is made here, in the one refill every plain reader goes through, rather than left
-to a backend; it then reads the same whichever backend is compiled.
-
-Both halves of the test are needed, and neither alone would do.  smtp_tls_was_active
-is set only where a server session has actually come up - transplanted in by ATRN,
-started on connection, or reached through STARTTLS - and never by a handshake that
-failed, which matters because a handshake can fail late enough to have recorded a
-cipher suite, and because Exim answers a failed one by reading on in clear to
-refuse with 554 until the peer gives up.  The active socket is what the teardown
-clears, and it is cleared by both backends. */
-
-if (smtp_tls_was_active && tls_in.active.sock < 0)
-  {
-  smtp_tls_session_ended();
-  return FALSE;
-  }
-
 smtp_fflush(SFF_UNCORK);
-
 if (smtp_receive_timeout > 0) ALARM(smtp_receive_timeout);
 
 /* Limit amount read, so non-message data is not fed to DKIM.
@@ -1116,23 +980,25 @@ lwr_receive_ungetc = NULL;
 *       Remap saved lower-layer receive fns      *
 *************************************************/
 
-/* Called from smtp_tls_session_ended() above, and from the settlement below, so
-that readers a chunked-body transfer saved cannot outlive the session they read
-through.  A pushed vector is remapped onto the plain SMTP readers rather than
-cleared, because the bdat_* dispatch sites call through it untested, and a null
+/* Called from the server side of a TLS teardown, before the session object and
+its transfer buffer are released, and from the settlement below, so that readers
+a chunked-body transfer saved cannot outlive the session they read through.
+Resetting the top-level receive_* vector is not enough on its own: the chunked
+readers are also called directly, and their pop above writes whatever was saved
+back as the top-level set.
+
+A pushed vector is remapped onto the plain SMTP readers rather than cleared,
+because the bdat_* dispatch sites call through it untested, and a null
 lwr_receive_getc keeps its meaning as the "nothing pushed" state that the push
 and pop above key on.  That also makes this safe when CHUNKING was never used,
 safe to call more than once, and idempotent once the saved vector already names
 the plain readers.
 
-What those remapped readers are then allowed to read is not settled here; the
-caller settles it, before the session is released.
-
 Arguments:  none
 Returns:    nothing
 */
 
-static void
+void
 bdat_invalidate_receive_functions(void)
 {
 if (!lwr_receive_getc) return;
@@ -1152,7 +1018,11 @@ above.  So test here as well, where whichever backend is compiled is covered by
 the same code: tls_getc() is declared once and supplied by the backend in use, and
 each backend clears the active socket of a session it closes.  Finding the saved
 vector still naming the session readers with no session active is exactly the
-condition under which they must not be called. */
+condition under which they must not be called.
+
+Arguments:  none
+Returns:    nothing
+*/
 
 static inline void
 bdat_settle_receive_functions(void)
@@ -2621,7 +2491,6 @@ smtp_buf_init();
 #ifndef DISABLE_TLS
 if (atrn_mode && tls_in.active.sock >= 0)
   {
-  smtp_tls_was_active = TRUE;		/* see smtp_refill() above */
   receive_getc = tls_getc;
   receive_getbuf = tls_getbuf;
   receive_get_cache = tls_get_cache;
@@ -3003,7 +2872,6 @@ if (tls_in.on_connect)
 
   if (tls_server_start(&user_msg, g) != OK)
     return smtp_log_tls_fail(user_msg);
-  smtp_tls_was_active = TRUE;		/* see smtp_refill() above */
   cmd_list[CL_TLAU].is_mail_cmd = TRUE;
   }
 #endif
@@ -4096,7 +3964,7 @@ while (done <= 0)
   void (*oldsignal)(int);
   pid_t pid;
   int start, end, sender_domain, recipient_domain;
-  int rc, c, dsn_flags, cmd;
+  int rc, c, dsn_flags;
   uschar * orcpt = NULL;
   gstring * g;
 
@@ -4144,15 +4012,13 @@ while (done <= 0)
     }
 #endif
 
-  cmd = smtp_read_command(
+  switch(smtp_read_command(
 #ifndef DISABLE_PIPE_CONNECT
 	  !fl.pipe_connect_acceptable,
 #else
 	  TRUE,
 #endif
-	  GETC_BUFFER_UNLIMITED);
-
-  switch(cmd)
+	  GETC_BUFFER_UNLIMITED))
     {
     /* The AUTH command is not permitted to occur inside a transaction, and may
     occur successfully only once per connection. Actually, that isn't quite
@@ -4179,7 +4045,6 @@ while (done <= 0)
 	  US"AUTH command used when not advertised");
 	break;
 	}
-
       if (sender_host_authenticated)
 	{
 	done = synprot_error(L_smtp_protocol_error, 503, NULL,
@@ -5767,7 +5632,6 @@ while (done <= 0)
       s = NULL;
       if ((rc = tls_server_start(&s, NULL)) == OK)
 	{
-	smtp_tls_was_active = TRUE;	/* see smtp_refill() above */
 	if (!tls_remember_esmtp)
 	  fl.helo_seen = fl.esmtp = fl.auth_advertised = f.smtp_in_pipelining_advertised = FALSE;
 	cmd_list[CL_EHLO].is_mail_cmd = TRUE;
@@ -5794,7 +5658,6 @@ while (done <= 0)
 	sender_host_auth_pubname = sender_host_authenticated = NULL;
 	authenticated_id = NULL;
 	sync_cmd_limit = NON_SYNC_CMD_NON_PIPELINING;
-
 	DEBUG(D_tls) debug_printf("TLS active\n");
 	break;     /* Successful STARTTLS */
 	}

@@ -616,9 +616,10 @@ ssize_t inbytes;
 /* The session and its transfer buffer are released together by tls_close(),
 which also nulls both pointers.  Note that we can be re-entered after that has
 happened: tls_close() is called from the end-of-transmission branch below, so
-the agent that releases the buffer and the consumer that would next read into
-it are the same call chain.  Fail closed rather than hand released memory to the
-library; the input on this connection was ended by that tls_close(). */
+the agent that releases the buffer and the consumer that would next read into it
+are the same call chain.  Fail closed rather than hand released memory to the
+library, and record the failure so that the caller reports the end of this input
+rather than reading the socket underneath in its place. */
 
 if (!state->session || !state->xfer_buffer)
   {
@@ -652,8 +653,8 @@ if (had_data_sigint)
   smtp_data_sigint_exit();
 
 /* Timeouts do not get this far.  A zero-byte return means the TLS session has
-ended even if the socket remains open; tear it down, which also ends the input on
-this connection before anything reads it again. */
+ended even if the socket remains open; tear it down, and let the caller settle
+what is left of the connection. */
 
 if (sigalrm_seen)
   {
@@ -669,9 +670,9 @@ else if (inbytes == 0)
   /* The peer has taken the session down while we were reading it, and the socket
   beneath it is still open.  Nothing more is written to it here, not even a closing
   alert: a peer that has already dropped its own session would read those bytes in
-  clear, and the released state is what has to be dealt with.  tls_close() releases
-  the session and its buffer, points the readers back at that socket, and ends the
-  input on this connection, so that nothing further is taken from it in clear. */
+  clear.  tls_close() releases the session and its buffer, nulls both pointers, and
+  takes every reader off them - including the set a chunked-body transfer saved -
+  so that nothing reaches the released state afterwards. */
 
   tls_close(NULL, TLS_NO_SHUTDOWN);
   return FALSE;
@@ -4109,18 +4110,13 @@ if (do_shutdown && state->session)
 
 if (!ct_ctx)	/* server */
   {
-  /* Point the top-level readers back at the plain socket, then end the input on
-  this connection.  The order matters: smtp_tls_session_ended() also settles the
-  saved BDAT readers - the chunked path dispatches through its own copy of the
-  vector, and its pop would otherwise reinstate the session readers as the
-  top-level ones - and it does so before the session and the transfer buffer they
-  read through are released just below.
-
-  Nothing further is read here, whatever point of the conversation the session
-  ended at: the declared remainder of a message, a header block or an
-  authentication exchange must not be taken in clear on a connection the peer
-  negotiated encryption for, and a peer that ends a session between commands has
-  to open a new connection rather than have this one carry on unprotected. */
+  /* Point the top-level readers back at the plain socket, and take the readers a
+  chunked-body transfer saved off this session too.  Resetting the top-level set
+  alone is not enough: the chunked path dispatches through its own saved copy of
+  the vector, and its pop writes that copy back as the top-level set - which
+  would reinstate readers belonging to a session that is about to be released.
+  Both are done here, before the session and the transfer buffer they read
+  through go, just below. */
 
   receive_getc =	smtp_getc;
   receive_getbuf =	smtp_getbuf;
@@ -4130,7 +4126,7 @@ if (!ct_ctx)	/* server */
   receive_feof =	smtp_feof;
   receive_ferror =	smtp_ferror;
 
-  smtp_tls_session_ended();
+  bdat_invalidate_receive_functions();
   }
 
 if (state->session)
@@ -4163,18 +4159,29 @@ fast paths from indexing a buffer that is no longer there. */
 state->xfer_buffer = NULL;
 state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
 
-/* This input is finished, whatever point of the conversation the shutdown
-arrived at: latch both flags.  The end-of-file flag is read by tls_feof(), which
-without it can only ever report this input as unfinished.  Latching the error
-flag leaves a stale TLS reader with an unmistakably finished input.
+/* The session is over: record its end of file.  That flag is what tls_feof()
+reports, and without it being set that call can only ever report this input as
+unfinished - which is why the end of a session has never been observable through
+it on this backend.
 
-Neither flag is what makes the end of the input observable after a server
-teardown: the vector reset above has already pointed the end-of-file check at
-smtp_feof(), which reports the plain reader's own record, and the call above has
-already ended that input.  A context that is given a buffer of its own clears the
-pair at the allocation site, so nothing inherits these latches. */
+The error flag decides what tls_getc() below does with a read that the session
+did not survive: report end of file, or take the same bytes from the socket in
+clear.  Reading on in clear is not a mistake in itself - it is how a session that
+ends between commands is meant to be left, and Exim's own smtp transport ends one
+that way and then continues the dialogue on the same connection, so both ends
+depend on it.  What must not happen is for it to continue a chunked transfer.
+That is the case in which the bytes arriving next are not the ones that were
+promised: treating them as message content would splice what the peer sends in
+clear into a message it sent under encryption, and - before the pointers above
+were cleared - would have read and written them through the released transfer
+buffer.  So latch the error while a chunk is being taken, and leave a session
+that ended between commands to be picked up in clear as before.
 
-state->xfer_eof = state->xfer_error = TRUE;
+A context that is given a buffer of its own clears both flags at the allocation
+site, so a later session on this connection inherits neither latch. */
+
+state->xfer_eof = TRUE;
+if (chunking_state > CHUNKING_OFFERED) state->xfer_error = TRUE;
 }
 
 
@@ -4200,20 +4207,20 @@ tls_getc(unsigned lim)
 exim_gnutls_state_st * state = &state_server;
 
 /* The buffer and the session are released together by tls_close(), which nulls
-both pointers; a stale reader reaching us afterwards sees end of file rather than
-the contents of released memory, and does not read the socket underneath in clear
-as if it were a continuation of the encrypted session. */
+both pointers.  A stale reader reaching us afterwards sees end of file rather
+than the contents of released memory. */
 
 if (!state->session || !state->xfer_buffer) return EOF;
 
-/* A refill that failed is the end of this input, whether the session went away
-under it or a read timed out with the session still intact.  Report end of file.
-The socket underneath the session is never read in its place: doing so would
-continue in clear a conversation the peer negotiated encryption for. */
+/* A refill that failed leaves nothing more to be had from the session.  The
+error latch decides what that means for the caller: end of file where the
+session went while a transfer was still owed data, or where a read timed out;
+otherwise the socket underneath, which the teardown leaves open, is read in
+clear, as it has to be for a session that ended between commands. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(lim))
-    return EOF;
+    return state->xfer_error ? EOF : smtp_getc(lim);
 
 /* Something in the buffer; return next uschar */
 
@@ -4243,12 +4250,13 @@ if (!state->session || !state->xfer_buffer)
   return NULL;
   }
 
-/* As in tls_getc() above: a failed refill ends this input.  Report nothing
-available rather than take the socket underneath in clear. */
+/* As in tls_getc() above, the error latch decides what a failed refill means:
+nothing available, or the same bytes taken from the socket in clear. */
 
 if (state->xfer_buffer_lwm >= state->xfer_buffer_hwm)
   if (!tls_refill(*len))
     {
+    if (!state->xfer_error) return smtp_getbuf(len);
     *len = 0;
     return NULL;
     }

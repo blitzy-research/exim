@@ -4,37 +4,19 @@ gnutls
 # A TLS session that goes away while a BDAT chunk is still being read leaves the
 # server holding readers, and a transfer buffer, belonging to a session that has
 # ceased to exist.  Reading has to stop there.  Going on would either reach into
-# the released buffer or read the rest of the connection in clear, on the socket
-# the peer negotiated encryption for.
+# the released buffer or take the rest of the chunk from the socket in clear, on
+# the connection the peer negotiated encryption for.
 #
-# Note for running this by hand: the daemon under test has to be the GnuTLS
-# build.  Hand that binary to runtest and leave --tls off - that is the case in
-# which the binary runtest was given is used at both ends, as $exim_client and as
-# $exim_server alike.  Given --tls, runtest works in its cross-library mode
-# instead: it picks the harness client program, and it also pairs the two
-# library-specific builds against each other, so "--tls gnutls" leaves the
-# OpenSSL build answering as $exim_server - and that build never frees the
-# transfer buffer this test is about.  Test numbers spanning more than one script
-# directory have to be asked for as a range, or one batch per directory.
-#
-exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
-****
-#
-# Chunk arithmetic - 85 declared, 84 sent, so one byte is still outstanding when
+# Chunk arithmetic - 88 declared, 20 sent, so 68 bytes are still outstanding when
 # the session goes.  The ">>> " prefix suppresses the trailing CRLF the client
-# would otherwise add, so the payload is exactly the text after it:
-#
-#     To: Susan@random.com CRLF      22
-#     From: Sam@random.com CRLF      22   (44)
-#     CRLF, ending the header block   2   (46)
-#     body-start-                    11   (57)
-#     27 x A                         27   (84)
-#
-# Both halves of that shape are load-bearing.  The header block has to be
-# complete, so that reception is past the header lines and into the body, which is
-# where a released transfer buffer is read and written.  And the chunk has to be
-# short, so that the session goes away with the transfer still owed data: a
-# reader which treats what arrived as the whole of the message would accept it.
+# would otherwise add, so the payload is exactly the 20 characters after it and
+# the header line it starts is left unfinished.  Both halves of that shape are
+# load-bearing.  The chunk has to be short, so that the session goes away with
+# the transfer still owed data: a reader which treated what arrived as the whole
+# of the message would accept a message the peer never finished sending.  And the
+# line has to be unfinished, so that the shutdown is what the reader meets next -
+# a line completed with a bare linefeed would instead be rejected for not being
+# CRLF terminated, which is a check made as each header line is taken.
 #
 # The reply is matched in full rather than as just "421" because the receive
 # timeout answers with a 421 of its own, and a loose match would be satisfied by
@@ -45,6 +27,9 @@ exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
 # unconsumed to reset over and its close is clean.  That is what lets the end of
 # file be asserted here, and asserting it is half the point: a server which
 # answered 421 and then left the socket usable would pass on the reply alone.
+#
+exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
+****
 #
 client-anytls 127.0.0.1 PORT_D
 ??? 220
@@ -69,8 +54,8 @@ MAIL FROM:<someone@some.domain>
 ??? 250
 RCPT TO:<CALLER@test.ex>
 ??? 250
-BDAT 85 LAST
->>> To: Susan@random.com\r\nFrom: Sam@random.com\r\n\r\nbody-start-AAAAAAAAAAAAAAAAAAAAAAAAAAA
+BDAT 88 LAST
+>>> To: Susan@random.com
 stoptls
 ??? 421 Lost incoming connection
 ???*
