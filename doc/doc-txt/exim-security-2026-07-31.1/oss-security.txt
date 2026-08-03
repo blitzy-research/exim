@@ -35,7 +35,10 @@ being received - a chunk still owed data, or a transaction that reached its
 sender or a recipient - now ends that message: the read path fails closed, the
 remainder is not taken from the socket in clear, and no further command is
 accepted on it. A terminal failure response still goes out in clear; a session
-ending with no message in progress, or one already refused, is unaffected.
+ending with no message in progress, or one already refused, is unaffected - a
+peer that ends one meaning to go on using the socket is still answered, and the
+smtp transport's hosts_noproxy_tls handoff, which is such a peer, keeps working
+unchanged.
 
 The one workaround is a compensating control, not a fix: restricting
 chunking_advertise_hosts so CHUNKING is not advertised removes the trigger, at

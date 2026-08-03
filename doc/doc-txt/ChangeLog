@@ -87,6 +87,9 @@ JH/21 Fix a use-after-free in the GnuTLS transfer buffer.  A TLS session shut
       released objects, both pointers are cleared as they are released, and the
       routines reading through either fail closed.  A session lost while a
       message is being received ends it rather than taking the rest in clear.
+      A session ending with no message in progress leaves the connection to
+      carry on as it did before, which the smtp transport relies on where
+      hosts_noproxy_tls matches.
 
 
 Exim version 4.99.1

@@ -10,6 +10,11 @@ spool/
 test-*
 failed-summary.log
 run-summary.log
-# Locally-generated TRUSTED_CONFIG_LIST for the harness (test/README item 9).
-# Holds an absolute path to this checkout, so it must never be committed.
+# Two files the harness itself produces in this directory and which must not be
+# committed.  trusted_configs is the TRUSTED_CONFIG_LIST the build is pointed at,
+# whose location test/README recommends be exactly here; it holds an absolute path
+# to the checkout it was generated in.  missingfile is created by test 2600, which
+# asks for a lookup against a deliberately absent database file named in this
+# directory.
 trusted_configs
+missingfile

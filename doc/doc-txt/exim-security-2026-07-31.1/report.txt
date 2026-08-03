@@ -179,9 +179,17 @@ session and never reach it. A terminal 421 reporting the lost connection still
 goes out, in clear, before the close: the guarantee is about the read path, and
 about no further command being taken on the message that was being read. It is
 not that nothing at all is transmitted after, nor that a connection is closed
-where the loss found no message in progress or a message already refused. The
-end of a session is also now observable through the end-of-file channel on this
-backend, where the flag behind it had never been assigned at all.
+where the loss found no message in progress or a message already refused.
+
+Ending a session mid-connection and going on in clear is a documented mode of
+operation, not the behaviour this corrects: the smtp transport does it wherever
+hosts_noproxy_tls matches, shutting the session down and greeting again in clear
+so that an open connection can be handed to the next delivery, which starts a
+session of its own. That keeps working exactly as before, and a connection
+carrying several messages is still logged as one connection.
+
+The end of a session is also now observable through the end-of-file channel on
+this backend, where the flag behind it had never been assigned at all.
 
 --------------------------------------------------------------------------------
 Verification
@@ -225,6 +233,51 @@ continuing in clear. No recorded output of any existing test is altered; the
 only outputs added are the reproducer's own. The automatic range is run on both
 trees, with both backends built, and compared: no test fails on the remediated
 tree that passes on the unremediated one.
+
+Four properties of the suite and of the environment it runs in are recorded
+here, none of them caused by this change and all of them reproducible on the
+unremediated tree, so that none is misread as a regression.
+
+The reproducer needs the daemon under test to be the GnuTLS build, so that
+binary is handed to the harness with the cross-library option left off:
+
+    cd test && ./runtest <gnutls-binary> --continue --test 2038
+
+Given that option the harness pairs the two library-specific builds against each
+other, leaving the OpenSSL build answering as the server - a build in which the
+defect does not arise. Thirteen pre-existing tests in the same category fail in
+that mode for the same reason. That server also answers this particular dialogue
+in a way no client can read: its own read path records an error without
+unregistering the session, so the terminal reply goes out through a session the
+peer has already dropped and the peer sees end of file instead. That is a
+property of that backend, unchanged here and outside what is edited; it is
+reported rather than fixed.
+
+The harness cannot be asked for test numbers from two script directories in one
+repeated-option invocation, so the state-transplant witnesses are run either as
+a range or as one invocation per directory.
+
+One pre-existing test is nondeterministic on a host with several CPUs, and only
+on its saved client-side debug transcript: the proxy and continued-delivery
+children of a handed-on connection write their termination lines in whichever
+order they are scheduled, and the saved copy records one of the two orders, the
+process numbers substituted into the neighbouring lines shifting with it. It
+reproduces at the same rate on the unremediated tree, and became visible again
+here only because connection re-use, and so those two children, works as it did
+before. Its saved copy is left exactly as it stands: the test is not one this
+change touches, and rewriting a recorded output to settle a race that predates
+the change would blunt the very comparison it is being read for. The two-tree
+comparison above is therefore read against that race, and the discriminator for
+a real regression is the unremediated-tree run, which is why it is part of the
+procedure rather than an optional extra.
+
+A further set of tests fails identically on both trees for reasons of the host
+and the installed library versions - IPv6 being unavailable, and the TLS
+releases present being newer than the ones the saved outputs were recorded
+against. And the harness binds a fixed block of ports, so only one run at a
+time is possible per checkout and concurrent checkouts need distinct blocks;
+without that, ports held by another checkout produce convincing failures that
+have nothing to do with the code under test.
 
 ================================================================================
 STATUS AND IDENTIFIERS
