@@ -1010,15 +1010,15 @@ lwr_receive_ungetc = smtp_ungetc;
 }
 
 
-/* Called from each of the dispatch points below, immediately before they call
-through the saved vector.  A server session can be taken down from underneath
-that vector - the TLS read path closes the session itself when the peer ends it -
-and only one of the two TLS backends routes its teardown through the function
-above.  So test here as well, where whichever backend is compiled is covered by
-the same code: tls_getc() is declared once and supplied by the backend in use, and
-each backend clears the active socket of a session it closes.  Finding the saved
-vector still naming the session readers with no session active is exactly the
-condition under which they must not be called.
+/* Called immediately before every dispatch through the saved vector.  A server
+session can be taken down from underneath that vector - the TLS read path closes
+the session itself when the peer ends it - and only one of the two TLS backends
+routes its teardown through the function above.  So test here as well, where
+whichever backend is compiled is covered by the same code: tls_getc() is declared
+once and supplied by the backend in use, and each backend clears the active
+socket of a session it closes.  Finding the saved vector still naming the session
+readers with no session active is exactly the condition under which they must not
+be called.
 
 Arguments:  none
 Returns:    nothing

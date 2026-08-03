@@ -652,8 +652,9 @@ if (had_data_timeout)
 if (had_data_sigint)
   smtp_data_sigint_exit();
 
-/* Timeouts do not get this far.  A zero-byte return means the TLS session has
-ended even if the socket remains open; tear it down, and let the caller settle
+/* The handlers above do not return.  A read that timed out leaves nothing more
+to be had from the session; a zero-byte return means the session itself has
+ended, even if the socket remains open, so tear it down and let the caller settle
 what is left of the connection. */
 
 if (sigalrm_seen)
@@ -2221,41 +2222,22 @@ else
 
   DEBUG(D_tls) debug_printf("initialising GnuTLS server session\n");
 
-  /* That re-use is why everything a session owns has to be dropped here, this
-  being the one point every server session passes through: the context is never
-  re-zeroed after process start (the template copy above is client-only), so
-  anything left set by a predecessor would be presented as belonging to the
-  session about to start.  What is dropped is state a session owns; the
-  credential cache in lib_state, and the expansions that pair with it, are
+  /* Session-derived state is dropped here, this being the one point every server
+  session passes through, and nothing else clearing it: what a predecessor left
+  set would otherwise be reported as belonging to the session about to start.
+  The credential cache in lib_state, and the expansions that pair with it, are
   deliberately kept - that is what makes them a cache.
 
-  Each of these is only ever set, or is only assigned on some of its paths, so
-  none of them is corrected by the session that follows:
-  . the SNI the peer sent, and the record of whether it drives file expansion,
-    are set from the handshake callback and never cleared, so a successor
-    without SNI would report and log its predecessor's;
-  . the peer's certificate, its DN and the cipher suite are recorded only when
-    there is something to record, and the "already recorded" latch suppresses
-    even that;
-  . the two verification results are assigned only on the paths that verify, so
-    a successor not asking for verification would report its predecessor's;
-  . the channel-binding type decides which binding an authenticator is told it
-    has, so a TLS 1.3 session followed by an earlier-version one would have
-    TLS-UNIQUE data labelled as TLS-EXPORTER;
-  . likewise the extended-master-secret record, which is only ever set.
-
-  Two of them are library objects rather than plain values, and this context is
-  their owner: peer_status() imports the peer's certificate and records it in
-  both state->peercert and tlsp->peercert, which are therefore one object under
-  two names, and extract_exim_vars_from_tls_state() imports ours into
-  tlsp->ourcert, for which there is no state-side field.  A successor session
+  Two of the fields name library objects that this context owns: the peer's
+  certificate, which peer_status() records in both state->peercert and
+  tlsp->peercert as one object under two names, and ours, which
+  extract_exim_vars_from_tls_state() records in tlsp->ourcert.  A successor
   imports its own, so release these rather than dropping the last reference to
-  them.  Here, at the start of a session, is the place to do it: what the
-  previous session reported stays readable through tlsp until the next one
-  begins, which is what the expansion variables and the logging of an accepted
-  message rely on.  gnutls_x509_crt_deinit() is called directly - not
-  tls_free_cert(), which additionally drops a library-initialisation reference
-  that import_cert() never took. */
+  them - and doing it here, at the start of a session, leaves what the previous
+  one reported readable through tlsp until then, which the expansion variables
+  and the logging of an accepted message rely on.  gnutls_x509_crt_deinit() is
+  called directly - not tls_free_cert(), which additionally drops a
+  library-initialisation reference that import_cert() never took. */
 
   if (state->peercert) gnutls_x509_crt_deinit(state->peercert);
   if (tlsp->ourcert) gnutls_x509_crt_deinit(tlsp->ourcert);
@@ -3382,20 +3364,20 @@ if (  gnutls_protocol_get_version(state->session) > GNUTLS_TLS1_2
 
   DEBUG(D_tls) debug_printf("TLS: wait for handshake complete\n");
 
-  /* A failure here is the session not surviving the wait: the peer went away, or
-  the read timed out.  tls_refill() tears the session down in the first case, so
-  nothing below - the flag query, the resumption bookkeeping, the debug of the
-  peer, the expansion variables - may touch it.  Report a failed handshake, and
-  send no alert: there may be no session left to send one on.
+  /* A failure here is the session not surviving the wait: either the peer ended
+  it, or the read timed out.  It is unusable in both cases, so nothing below -
+  the flag query, the resumption bookkeeping, the debug of the peer, the
+  expansion variables - may touch it.  Report a failed handshake, and send no
+  alert: a peer that has ended its own session would read those bytes in clear.
 
   Release the session and the buffer here rather than leaving that to teardown.
   This is still ahead of the point at which the session is registered as the
   active one for the connection (extract_exim_vars_from_tls_state() below), and
-  tls_close() returns at its entry guard while it is unregistered - so neither
-  the teardown tls_refill() attempts on the peer-went-away path nor any later
-  one releases anything, and both objects would be held until the process
-  ended.  Release what is still here rather than assuming which way the wait
-  failed, and null the pointers, so that this cannot become a double release. */
+  tls_close() returns at its entry guard while it is unregistered - so the close
+  that tls_refill() attempts on the peer-ended path releases nothing, nor would
+  any later one, and both objects would be held until the process ended.  Release
+  what is still here rather than assuming which way the wait failed, and null the
+  pointers, so that this cannot become a double release. */
 
   if (!tls_refill(GETC_BUFFER_UNLIMITED))
     {
@@ -4137,10 +4119,13 @@ if (state->session)
 
 /* The peer status was computed once for the session that has just gone, and the
 server context that holds the record of that is reused for a later session on the
-same connection.  Drop the record, so that a later session computes its own
-cipher, version and peer certificate rather than presenting this session's as
-though they were its own.  What has already been reported for this session is
-untouched: the reported values were copied out, not aliased. */
+same connection.  Drop the "already recorded" latch, so that a later session
+computes its own cipher, version and peer certificate rather than presenting this
+session's as though they were its own.  The tls_support fields are left set: they
+are what the logging of an accepted message and the expansion variables read once
+the session has gone.  A later session records its own over them, and releases
+the peer certificate they name - one object, owned by this context - as it
+starts. */
 
 state->have_set_peerdn = FALSE;
 
@@ -4159,23 +4144,15 @@ fast paths from indexing a buffer that is no longer there. */
 state->xfer_buffer = NULL;
 state->xfer_buffer_lwm = state->xfer_buffer_hwm = 0;
 
-/* The session is over: record its end of file.  That flag is what tls_feof()
-reports, and without it being set that call can only ever report this input as
-unfinished - which is why the end of a session has never been observable through
-it on this backend.
+/* The session is over: record its end of file, which is what tls_feof() reports.
 
-The error flag decides what tls_getc() below does with a read that the session
-did not survive: report end of file, or take the same bytes from the socket in
-clear.  Reading on in clear is not a mistake in itself - it is how a session that
-ends between commands is meant to be left, and Exim's own smtp transport ends one
-that way and then continues the dialogue on the same connection, so both ends
-depend on it.  What must not happen is for it to continue a chunked transfer.
-That is the case in which the bytes arriving next are not the ones that were
-promised: treating them as message content would splice what the peer sends in
-clear into a message it sent under encryption, and - before the pointers above
-were cleared - would have read and written them through the released transfer
-buffer.  So latch the error while a chunk is being taken, and leave a session
-that ended between commands to be picked up in clear as before.
+The error latch is what keeps the read routines below from taking the remainder
+of a chunked transfer from the socket in clear: the bytes arriving next are not
+the ones that were promised, and treating them as message content would splice
+what the peer sends in clear into a message it sent under encryption.  A session
+that ends between commands has nothing outstanding and is meant to be picked up
+in clear - Exim's own smtp transport ends one that way and continues the dialogue
+on the same connection - so latch the error only while a chunk is being taken.
 
 A context that is given a buffer of its own clears both flags at the allocation
 site, so a later session on this connection inherits neither latch. */

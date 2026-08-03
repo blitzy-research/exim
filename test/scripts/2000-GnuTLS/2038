@@ -9,14 +9,10 @@ gnutls
 #
 # Chunk arithmetic - 88 declared, 20 sent, so 68 bytes are still outstanding when
 # the session goes.  The ">>> " prefix suppresses the trailing CRLF the client
-# would otherwise add, so the payload is exactly the 20 characters after it and
-# the header line it starts is left unfinished.  Both halves of that shape are
-# load-bearing.  The chunk has to be short, so that the session goes away with
-# the transfer still owed data: a reader which treated what arrived as the whole
-# of the message would accept a message the peer never finished sending.  And the
-# line has to be unfinished, so that the shutdown is what the reader meets next -
-# a line completed with a bare linefeed would instead be rejected for not being
-# CRLF terminated, which is a check made as each header line is taken.
+# would otherwise add, so the payload is exactly the 20 characters after it.  The
+# chunk has to be short: what was declared is then still incomplete when the
+# session ends, and a reader which treated what arrived as the whole of the
+# message would accept a message the peer never finished sending.
 #
 # The reply is matched in full rather than as just "421" because the receive
 # timeout answers with a 421 of its own, and a loose match would be satisfied by
