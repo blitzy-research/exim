@@ -108,7 +108,9 @@ Buffer, session handle and the callbacks on both are given one joint lifetime.
     through: the peer's server name, both certificates, the DN and cipher
     suite, the verification results and the binding records, none of which is
     then presented as a successor's own. The two certificates are library
-    objects this context owns, and are released there, once each; only the
+    objects this context owns, and are released there, once each - the peer's
+    only while the record kept for the connection still names it, so one that
+    something else has already released is not released twice. Only the
     credential cache is kept, and what a finished session reported stays
     readable until the next begins.
 
@@ -120,20 +122,37 @@ Buffer, session handle and the callbacks on both are given one joint lifetime.
     reader back as a top-level one - neither depending on which backend tore
     the session down.
 
--   A read the session did not survive is failed closed where the session went
-    while a chunked transfer was still owed data: the message in progress fails
-    and no further command is taken. A session that ended between commands is
-    left as before, its connection picked up in clear, that being how such a
-    session is handed on - Exim's own smtp transport ends one that way and
-    continues the dialogue. Bytes arriving in clear after a chunk was promised
-    are not the promised bytes.
+-   A read the session did not survive is failed closed wherever anything was
+    still owed to the message being received - a chunk with data outstanding,
+    or a transaction that had reached its sender or a recipient. The reader
+    reports end of file instead of taking the rest from the socket in clear,
+    and reading a message is where that end of file ends the connection, so the
+    message fails and no further command is taken on it. Bytes arriving in
+    clear after a chunk was promised are not the promised bytes. A chunk count
+    on its own would not have covered this, standing at "offered" between one
+    chunk and the next and never above it for a message sent with DATA.
 
--   Every consumer of the buffer or the session tests for release before use
-    and answers from that test: a reader finding its session gone reports end
-    of file, and does not fall back to the socket underneath. The one-byte
-    write in shared code is guarded the same way, correctly for both backends,
-    and the transplant paths hand sole ownership to the context that will close
-    it. A session ending before its handshake completes is reported as failed.
+-   A session that ended with no message in progress is left as before, its
+    connection picked up in clear, that being how such a session is handed on -
+    Exim's own smtp transport ends one that way and continues the dialogue. So
+    is a connection whose message had already been refused before the loss was
+    seen and whose transaction was reset with it: the refusal of a header line
+    not ended with CRLF under CHUNKING answers 552 and drains the rest of the
+    chunk, and that dialogue goes on in clear. Either way the connection keeps
+    what the ended session recorded, that being what a message accepted under
+    it is logged with, so a message taken afterwards carries it too.
+
+-   Every consumer that can be reached once the buffer or the session has been
+    released tests for that before use and answers from the test: a reader
+    finding its session gone reports end of file, and does not fall back to the
+    socket underneath. The one-byte write in shared code is guarded the same
+    way, correctly for both backends, and the transplant paths hand sole
+    ownership to the context that will close it. A session given up before it
+    becomes the connection's own - its handshake not completed, a required
+    protocol not negotiated, a peer certificate not verified - releases both
+    objects itself, teardown not reaching a session that was never registered,
+    and a buffer is allocated only for a context that has none, as on the other
+    backend.
 
 Changes are confined to the TLS transfer-buffer lifetime logic and the
 chunked-body handling: src/src/tls-gnu.c, src/src/tls.c, src/src/smtp_in.c, and
@@ -152,12 +171,15 @@ vendor backports see <https://wiki.exim.org/EximSecurity> and
 Behavioural Change
 --------------------------------------------------------------------------------
 
-A peer that takes its session down while a chunk is still owed data is answered
-with end of file rather than having the rest of that chunk read from the socket
-in clear; well-behaved clients finish or abandon a chunk within the session and
-never reach it. A terminal 421 reporting the lost connection still goes out, in
-clear, before the close: the guarantee is about the read path, and about no
-further command being taken, not that nothing at all is transmitted after. The
+A peer that takes its session down while a message is still being received - a
+chunk still owed data, or a transaction that had reached its sender or a
+recipient - is answered with end of file rather than having the rest read from
+the socket in clear; well-behaved clients finish or abandon a message inside the
+session and never reach it. A terminal 421 reporting the lost connection still
+goes out, in clear, before the close: the guarantee is about the read path, and
+about no further command being taken on the message that was being read. It is
+not that nothing at all is transmitted after, nor that a connection is closed
+where the loss found no message in progress or a message already refused. The
 end of a session is also now observable through the end-of-file channel on this
 backend, where the flag behind it had never been assigned at all.
 

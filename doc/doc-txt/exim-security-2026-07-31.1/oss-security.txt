@@ -10,18 +10,18 @@ Dear Exim users,
 we have identified, by code inspection, a memory-safety defect in the
 GnuTLS-backed SMTP server: a TLS session torn down mid-transfer of a chunked
 body (BDAT, from the CHUNKING extension) frees the transfer buffer and destroys
-the session, while the readers bound to both stay installed and dispatched.
-
-A remote, unauthenticated attacker reaches this on a stock build - CHUNKING and
+the session, while the readers bound to both stay installed and dispatched. A
+remote, unauthenticated attacker reaches it on a stock build - CHUNKING and
 STARTTLS are advertised by default - by ending a session mid-chunk with the
-socket left open; the result is heap corruption, attacker-supplied bytes being
+socket left open, and the result is heap corruption, attacker-supplied bytes
 decoded into a freed allocation.
 
 Affected are GnuTLS-backend builds: the 4.100 development tree and all
 preceding releases that shipped that backend with CHUNKING support - a bound we
 cannot narrow, the earliest affected release not being establishable from the
 source tree alone. OpenSSL builds never release the buffer and so have no
-use-after-free; the crash their equivalent path yields is closed with it.
+use-after-free; the crash their equivalent path yields is closed with it, their
+own byte reader being left as it is, no OpenSSL source touched.
 
 The remediation gives the buffer, the session handle and the readers working
 through them one jointly enforced lifetime: both pointers are cleared as they
@@ -30,11 +30,12 @@ transfer state is reset wherever a session is given a buffer, and each routine
 reading through either object fails closed. No API, ABI, wire protocol, spool
 format, option, default or chunking-state transition changes.
 
-One change is visible to operators: a session lost while a chunk is still owed
-data now ends the message - the read path fails closed, no further command is
-accepted, and the remainder is no longer read from the socket in clear. A
-terminal failure response does still go out in clear; a session ending between
-commands is unaffected.
+One change is visible to operators: a session lost while a message is still
+being received - a chunk still owed data, or a transaction that reached its
+sender or a recipient - now ends that message: the read path fails closed, the
+remainder is not taken from the socket in clear, and no further command is
+accepted on it. A terminal failure response still goes out in clear; a session
+ending with no message in progress, or one already refused, is unaffected.
 
 The one workaround is a compensating control, not a fix: restricting
 chunking_advertise_hosts so CHUNKING is not advertised removes the trigger, at
@@ -49,7 +50,7 @@ Identifiers found elsewhere in the tree are other, historical issues.
 
 2026-07-31: we identified the defect by code inspection
 2026-07-31: remediation prepared
-2026-08-02: remediation reviewed, revised and verified
+2026-08-03: remediation reviewed, revised and verified
 ~2026-08-04: publish the fix via the distros repo (for the distro packagers)
 ~2026-08-07: publish the fix via the default repo (for the public)
 

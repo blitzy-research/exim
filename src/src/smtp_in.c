@@ -939,7 +939,13 @@ if (!lwr_receive_getc)
   }
 else
   {
+  /* Already pushed, so the functions installed below are the top-level ones
+  already - except after a TLS teardown, which points the top-level set back at
+  the plain socket while a vector is still pushed.  Installing them again there
+  would undo that reset, so leave the top-level set alone in this case. */
+
   DEBUG(D_receive) debug_printf("chunking double-push receive functions\n");
+  return;
   }
 
 receive_getc = bdat_getc;
@@ -1042,12 +1048,9 @@ chunking_data_left++;
 /* We're not done yet, so the saved lower-layer vector has to be in place for
 the dispatch below.  bdat_getc() pops it as soon as a chunk runs out, so on the
 end-of-data path it has to be pushed back; on the header-reading path it is
-still pushed and there is nothing to do.  Push only in the former case: pushing
-again when it is already pushed reports a double push and would also reinstate
-the bdat_* functions as the top-level ones, undoing the reader reset that TLS
-teardown makes. */
+still pushed, and the push above then leaves the top-level set as it is. */
 
-if (!lwr_receive_getc) bdat_push_receive_functions();
+bdat_push_receive_functions();
 
 bdat_settle_receive_functions();
 

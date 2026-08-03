@@ -85,8 +85,8 @@ JH/21 Fix a use-after-free in the GnuTLS transfer buffer.  A TLS session shut
       session, leaving the readers bound to them installed - including the set
       saved by the chunked-body layer.  Those readers are now taken off the
       released objects, both pointers are cleared as they are released, and the
-      routines reading through either fail closed.  A session lost with a chunk
-      still owed data ends the message instead of taking the rest in clear.
+      routines reading through either fail closed.  A session lost while a
+      message is being received ends it rather than taking the rest in clear.
 
 
 Exim version 4.99.1
