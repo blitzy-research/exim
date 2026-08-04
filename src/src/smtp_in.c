@@ -351,6 +351,16 @@ static int     smtp_had_eof;
 static int     smtp_had_error;
 
 
+/* Set when the settlement below finds the readers a chunked-body transfer saved
+naming a session which has gone.  What is still owed on the chunk can then only
+come from the socket underneath in clear, which is not what the peer promised to
+send, so nothing more is taken for the message: the chunked readers report the
+end of their input instead.  Cleared as each transfer is pushed, so a later one
+on a live session is unaffected. */
+
+static BOOL    bdat_session_gone = FALSE;
+
+
 /* forward declarations */
 static int smtp_read_command(BOOL check_sync, unsigned buffer_lim);
 static void smtp_quit_handler(uschar **, uschar **);
@@ -830,6 +840,13 @@ for(;;)
   {
   bdat_settle_receive_functions();
 
+  /* The session this transfer was being read through has gone with the chunk
+  incomplete.  Report the end of the input rather than dispatching: the caller
+  then treats the connection as one which went away in the middle of a message,
+  which is what happened. */
+
+  if (bdat_session_gone) return EOF;
+
   if (chunking_data_left > 0)
     return lwr_receive_getc(chunking_data_left--);
 
@@ -968,6 +985,11 @@ bdat_hasc(void)
 {
 bdat_settle_receive_functions();
 
+/* Nothing is going to block: the reader above answers at once, with the end of
+its input.  Say so, as this does for an exhausted chunk. */
+
+if (bdat_session_gone) return TRUE;
+
 if (chunking_data_left > 0)
   return lwr_receive_hasc();
 return TRUE;
@@ -982,6 +1004,13 @@ if (chunking_data_left == 0)
   { *len = 0; return NULL; }
 
 bdat_settle_receive_functions();
+
+/* As in bdat_getc() above: the session went with the chunk incomplete, so report
+nothing available rather than taking the rest of the message from the socket
+underneath in clear. */
+
+if (bdat_session_gone)
+  { *len = 0; return NULL; }
 
 if (*len > chunking_data_left) *len = chunking_data_left;
 buf = lwr_receive_getbuf(len);	/* Either smtp_getbuf or tls_getbuf */
@@ -1013,6 +1042,13 @@ DEBUG(D_receive)
 static inline void
 bdat_push_receive_functions(void)
 {
+/* A transfer starting here reads through whatever session is current, so the
+record of a previous one having gone does not apply to it.  A push is reached
+only by way of a command read on a live connection, so there is a session for it
+to read through. */
+
+bdat_session_gone = FALSE;
+
 /* push the current receive_* function on the "stack", and
 replace them by bdat_getc(), which in turn will use the lwr_receive_*
 functions to do the dirty work. */
@@ -1121,7 +1157,22 @@ bdat_settle_receive_functions(void)
 {
 #ifndef DISABLE_TLS
 if (lwr_receive_getc == tls_getc && tls_in.active.sock < 0)
+  {
+  /* Reaching this means a chunk was in progress when the session went, since a
+  vector is saved only for the duration of one, and that what the chunk still
+  owes was never sent under the session it was promised under.  Record it: the
+  remap below leaves the readers pointing at the plain socket, and reading the
+  rest of the message from there would splice bytes the peer sent in clear into
+  a message it began under encryption, and accept as complete a message it never
+  finished sending.  The backend whose teardown calls the remap directly latches
+  the same refusal in its own read path; this covers the other one, for which
+  the remap is the only notice the chunked layer gets. */
+
+  DEBUG(D_receive)
+    debug_printf("chunking transfer session gone: refusing the message\n");
+  bdat_session_gone = TRUE;
   bdat_invalidate_receive_functions();
+  }
 #endif
 }
 
@@ -1150,6 +1201,12 @@ if (!lwr_receive_getc)
   bdat_push_receive_functions();
 
 bdat_settle_receive_functions();
+
+/* Nothing will read the character back: the reader above reports the end of its
+input from here on.  Hold it here rather than pushing it into the plain socket's
+buffer, which has nothing of this message in it to put it back in front of. */
+
+if (bdat_session_gone) return ch;
 
 return lwr_receive_ungetc(ch);
 }
