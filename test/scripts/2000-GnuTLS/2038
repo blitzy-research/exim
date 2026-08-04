@@ -1,0 +1,83 @@
+# TLS server, CHUNKING reception with TLS shutdown mid-chunk
+gnutls
+#
+# A TLS session that goes away while a BDAT chunk is still being read leaves the
+# server holding readers, and a transfer buffer, belonging to a session that has
+# ceased to exist.  Reading has to stop there.  Going on would either reach into
+# the released buffer or take the rest of the chunk from the socket in clear, on
+# the connection the peer negotiated encryption for.
+#
+# Chunk arithmetic - 88 declared, 20 sent, so 68 bytes are still outstanding when
+# the session goes.  The ">>> " prefix suppresses the trailing CRLF the client
+# would otherwise add, so the payload is exactly the 20 characters after it.  The
+# chunk has to be short: what was declared is then still incomplete when the
+# session ends, and a reader which treated what arrived as the whole of the
+# message would accept a message the peer never finished sending.
+#
+# The reply is matched in full rather than as just "421" because the receive
+# timeout answers with a 421 of its own, and a loose match would be satisfied by
+# the very behaviour this test exists to reject - a server that keeps reading the
+# plain socket has nothing to read there, and says so when the timeout expires.
+#
+# Nothing is offered in clear after the shutdown, so the server has nothing
+# unconsumed to reset over and its close is clean.  That is what lets the end of
+# file be asserted here, and asserting it is half the point: a server which
+# answered 421 and then left the socket usable would pass on the reply alone.
+#
+# Note for running this by hand: the daemon under test has to be the GnuTLS
+# build.  Hand that binary to runtest and leave --tls off:
+#
+#     cd test && ./runtest <gnutls-binary> --continue --test 2038
+#
+# That is the case in which the binary runtest was given is used at both ends, as
+# $exim_client and as $exim_server alike.  Given --tls, runtest works in its
+# cross-library mode instead: it picks the harness client program, and it also
+# pairs the two library-specific builds against each other, so "--tls gnutls"
+# leaves the OpenSSL build answering as $exim_server.  That build never frees the
+# transfer buffer this test is about, and it answers this dialogue in a way no
+# client can read: its own read path records an error without unregistering the
+# session, so the 421 below is written through the session the peer has already
+# dropped and the peer reaches end of file without seeing it.  Thirteen
+# pre-existing tests in this directory fail in that mode for the same kind of
+# reason - 2000, 2001, 2002, 2012, 2014, 2024, 2025, 2027, 2029, 2031, 2033,
+# 2034 and 2090 - and the category's REQUIRES cannot express a condition on
+# $exim_server, only on the binary handed to runtest.  Test numbers spanning more
+# than one script directory have to be asked for as a range, or one batch per
+# directory.
+#
+exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
+****
+#
+client-anytls 127.0.0.1 PORT_D
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+STARTTLS
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250 HELP
+MAIL FROM:<someone@some.domain>
+??? 250
+RCPT TO:<CALLER@test.ex>
+??? 250
+BDAT 88 LAST
+>>> To: Susan@random.com
+stoptls
+??? 421 Lost incoming connection
+???*
+****
+millisleep 500
+killdaemon
+#
+no_msglog_check

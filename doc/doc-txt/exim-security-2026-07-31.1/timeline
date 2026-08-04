@@ -1,0 +1,8 @@
+2026-07-31: we identified a use-after-free in the gnutls tls backend by code inspection
+2026-07-31: remediation prepared
+2026-08-03: remediation reviewed, revised and verified under a sanitizer and the regression suite
+2026-08-04: sanitizer reproducer separated from the fail-closed witnesses
+2026-08-04: the refusal of an unfinished message made a property of the chunked-body layer, so that it holds on both TLS backends; acceptance run repeated on both trees with IPv6 present
+planned:
+2026-08-05 15:00UTC: publish the fix via the distros repo (accessible for the distro packagers)
+2026-08-08 15:00UTC: publish the fix via the default repo (accessible for the public)

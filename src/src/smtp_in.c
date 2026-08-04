@@ -351,10 +351,21 @@ static int     smtp_had_eof;
 static int     smtp_had_error;
 
 
+/* Set when the settlement below finds the readers a chunked-body transfer saved
+naming a session which has gone.  What is still owed on the chunk can then only
+come from the socket underneath in clear, which is not what the peer promised to
+send, so nothing more is taken for the message: the chunked readers report the
+end of their input instead.  Cleared as each transfer is pushed, so a later one
+on a live session is unaffected. */
+
+static BOOL    bdat_session_gone = FALSE;
+
+
 /* forward declarations */
 static int smtp_read_command(BOOL check_sync, unsigned buffer_lim);
 static void smtp_quit_handler(uschar **, uschar **);
 static void smtp_rset_handler(void);
+static inline void bdat_settle_receive_functions(void);
 
 /*************************************************
 *          Log incomplete transactions           *
@@ -725,6 +736,75 @@ static inline void bdat_push_receive_functions(void);
 static inline void bdat_pop_receive_functions(void);
 
 
+/* Read the argument of a BDAT command.  RFC 3030 sect 2 gives the command as
+
+    bdat-cmd   = "BDAT" SP chunk-size [ SP end-marker ] CR LF
+    chunk-size = 1*DIGIT
+    end-marker = "LAST"
+
+The whole argument is checked here, and nothing is taken from it until it has
+all been accepted, so that a command which does not parse leaves the chunking
+state as it was rather than putting the connection into a chunk it can never
+complete.  A conversion which merely stops at the first character it cannot use
+is not enough for that: it takes a sign, says nothing about a value too large
+for the counter to hold, and leaves whatever follows the size unexamined.  So a
+negative or an oversized size became a chunk of 4294967295 bytes, and anything
+at all could stand where the end marker belongs and simply mean the marker was
+absent - either way leaving the connection waiting for data the peer was never
+going to send, until the receive timeout ended it.
+
+The size is not required to be separated from what follows it, and trailing
+whitespace is ignored rather than refused, both being accepted before.  A
+client which writes the marker means it, and reading it as absent would leave a
+message it said was complete unterminated.
+
+Arguments:
+  sizep		set to the chunk size, if the argument is accepted
+  lastp		set TRUE if the end marker is present, FALSE if it is not
+  errp		set to the text of the protocol error, if it is not
+
+Returns:	TRUE if the argument was accepted, else FALSE
+*/
+
+static BOOL
+bdat_parse_argument(unsigned * sizep, BOOL * lastp, uschar ** errp)
+{
+const uschar * s = smtp_cmd_data, * end;
+unsigned long size;
+
+if (!isdigit(*s))
+  {
+  *errp = US"missing size for BDAT command";
+  return FALSE;
+  }
+
+errno = 0;
+size = Ustrtoul(s, &end, 10);
+if (errno == ERANGE || size > UINT_MAX)
+  {
+  *errp = US"size too large for BDAT command";
+  return FALSE;
+  }
+
+s = end;
+Uskip_whitespace(&s);
+for (end = s + Ustrlen(s); end > s && isspace(end[-1]); ) end--;
+
+if (end == s)
+  *lastp = FALSE;
+else if (end - s == 4 && strncmpic(s, US"LAST", 4) == 0)
+  *lastp = TRUE;
+else
+  {
+  *errp = US"malformed end marker for BDAT command";
+  return FALSE;
+  }
+
+*sizep = (unsigned) size;
+return TRUE;
+}
+
+
 /* Get a byte from the smtp input, in CHUNKING mode.  Handle ack of the
 previous BDAT chunk and getting new ones when we run out.  Uses the
 underlying smtp_getc or tls_getc both for that and for getting the
@@ -758,11 +838,30 @@ dkim_pause = dkim_info
 
 for(;;)
   {
+  bdat_settle_receive_functions();
+
+  /* The session this transfer was being read through has gone with the chunk
+  incomplete.  Report the end of the input rather than dispatching: the caller
+  then treats the connection as one which went away in the middle of a message,
+  which is what happened. */
+
+  if (bdat_session_gone) return EOF;
 
   if (chunking_data_left > 0)
     return lwr_receive_getc(chunking_data_left--);
 
-  bdat_pop_receive_functions();
+  /* The chunk is exhausted, so take the saved vector back off: the next command
+  has to be read through the readers underneath this one.  Ask for the pop only
+  when there is a vector to pop.  This is reached twice with nothing pushed when
+  a message ends without a byte of body to read - a zero-sized last chunk gives
+  the headers loop and the body loop an immediate end of data each - and asking
+  for a pop there would report a fault that has not happened: what the pop
+  reports is a bookkeeping fault for a caller which means to take a saved vector
+  off, and this one only needs it off.  What the pop reports is left exactly as
+  it was for any caller that does mean it. */
+
+  if (lwr_receive_getc)
+    bdat_pop_receive_functions();
 #ifndef DISABLE_DKIM
   if (dkim_pause) dkim_pause(TRUE);
 #endif
@@ -846,16 +945,17 @@ next_cmd:
 
     case BDAT_CMD:
       {
-      int n;
+      unsigned size;
+      BOOL last;
+      uschar * errmsg;
 
-      if (sscanf(CS smtp_cmd_data, "%u %n", &chunking_datasize, &n) < 1)
+      if (!bdat_parse_argument(&size, &last, &errmsg))
 	{
-	(void) synprot_error(L_smtp_protocol_error, 501, NULL,
-	  US"missing size for BDAT command");
+	(void) synprot_error(L_smtp_protocol_error, 501, NULL, errmsg);
 	return ERR;
 	}
-      chunking_state = strcmpic(smtp_cmd_data+n, US"LAST") == 0
-	? CHUNKING_LAST : CHUNKING_ACTIVE;
+      chunking_datasize = size;
+      chunking_state = last ? CHUNKING_LAST : CHUNKING_ACTIVE;
       chunking_data_left = chunking_datasize;
       DEBUG(D_receive) debug_printf("chunking state '%s', %d bytes\n",
 			chunking_states[chunking_state], chunking_data_left);
@@ -883,6 +983,13 @@ next_cmd:
 BOOL
 bdat_hasc(void)
 {
+bdat_settle_receive_functions();
+
+/* Nothing is going to block: the reader above answers at once, with the end of
+its input.  Say so, as this does for an exhausted chunk. */
+
+if (bdat_session_gone) return TRUE;
+
 if (chunking_data_left > 0)
   return lwr_receive_hasc();
 return TRUE;
@@ -894,6 +1001,15 @@ bdat_getbuf(unsigned * len)
 uschar * buf;
 
 if (chunking_data_left == 0)
+  { *len = 0; return NULL; }
+
+bdat_settle_receive_functions();
+
+/* As in bdat_getc() above: the session went with the chunk incomplete, so report
+nothing available rather than taking the rest of the message from the socket
+underneath in clear. */
+
+if (bdat_session_gone)
   { *len = 0; return NULL; }
 
 if (*len > chunking_data_left) *len = chunking_data_left;
@@ -911,7 +1027,12 @@ while (chunking_data_left)
   if (!bdat_getbuf(&n)) break;
   }
 
-bdat_pop_receive_functions();
+/* As in bdat_getc() above: this caller needs the saved vector off rather than
+meaning to take it off, and the reader may already have taken it off when the
+chunk it was draining ran out.  Ask for the pop only when there is one to do. */
+
+if (lwr_receive_getc)
+  bdat_pop_receive_functions();
 chunking_state = CHUNKING_OFFERED;
 DEBUG(D_receive)
   debug_printf("chunking state '%s'\n", chunking_states[chunking_state]);
@@ -921,6 +1042,13 @@ DEBUG(D_receive)
 static inline void
 bdat_push_receive_functions(void)
 {
+/* A transfer starting here reads through whatever session is current, so the
+record of a previous one having gone does not apply to it.  A push is reached
+only by way of a command read on a live connection, so there is a session for it
+to read through. */
+
+bdat_session_gone = FALSE;
+
 /* push the current receive_* function on the "stack", and
 replace them by bdat_getc(), which in turn will use the lwr_receive_*
 functions to do the dirty work. */
@@ -933,7 +1061,13 @@ if (!lwr_receive_getc)
   }
 else
   {
+  /* Already pushed, so the functions installed below are the top-level ones
+  already - except after a TLS teardown, which points the top-level set back at
+  the plain socket while a vector is still pushed.  Installing them again there
+  would undo that reset, so leave the top-level set alone in this case. */
+
   DEBUG(D_receive) debug_printf("chunking double-push receive functions\n");
+  return;
   }
 
 receive_getc = bdat_getc;
@@ -950,6 +1084,14 @@ if (!lwr_receive_getc)
   DEBUG(D_receive) debug_printf("chunking double-pop receive functions\n");
   return;
   }
+
+/* This is the one place a saved reader is written back as a top-level one, so
+settle the saved vector first: promoting a reader belonging to a session that has
+gone is what the settlement below exists to prevent, and a pop can be reached
+without a read in between. */
+
+bdat_settle_receive_functions();
+
 receive_getc = lwr_receive_getc;
 receive_getbuf = lwr_receive_getbuf;
 receive_hasc = lwr_receive_hasc;
@@ -961,11 +1103,111 @@ lwr_receive_hasc = NULL;
 lwr_receive_ungetc = NULL;
 }
 
+
+/*************************************************
+*       Remap saved lower-layer receive fns      *
+*************************************************/
+
+/* Called from the server side of a TLS teardown, before the session object and
+its transfer buffer are released, and from the settlement below, so that readers
+a chunked-body transfer saved cannot outlive the session they read through.
+Resetting the top-level receive_* vector is not enough on its own: the chunked
+readers are also called directly, and their pop above writes whatever was saved
+back as the top-level set.
+
+A pushed vector is remapped onto the plain SMTP readers rather than cleared,
+because the bdat_* dispatch sites call through it untested, and a null
+lwr_receive_getc keeps its meaning as the "nothing pushed" state that the push
+and pop above key on.  That also makes this safe when CHUNKING was never used,
+safe to call more than once, and idempotent once the saved vector already names
+the plain readers.
+
+Arguments:  none
+Returns:    nothing
+*/
+
+void
+bdat_invalidate_receive_functions(void)
+{
+if (!lwr_receive_getc) return;
+
+lwr_receive_getc = smtp_getc;
+lwr_receive_getbuf = smtp_getbuf;
+lwr_receive_hasc = smtp_hasc;
+lwr_receive_ungetc = smtp_ungetc;
+}
+
+
+/* Called immediately before every dispatch through the saved vector.  A server
+session can be taken down from underneath that vector - the TLS read path closes
+the session itself when the peer ends it - and only one of the two TLS backends
+routes its teardown through the function above.  So test here as well, where
+whichever backend is compiled is covered by the same code: tls_getc() is declared
+once and supplied by the backend in use, and each backend clears the active
+socket of a session it closes.  Finding the saved vector still naming the session
+readers with no session active is exactly the condition under which they must not
+be called.
+
+Arguments:  none
+Returns:    nothing
+*/
+
+static inline void
+bdat_settle_receive_functions(void)
+{
+#ifndef DISABLE_TLS
+if (lwr_receive_getc == tls_getc && tls_in.active.sock < 0)
+  {
+  /* Reaching this means a chunk was in progress when the session went, since a
+  vector is saved only for the duration of one, and that what the chunk still
+  owes was never sent under the session it was promised under.  Record it: the
+  remap below leaves the readers pointing at the plain socket, and reading the
+  rest of the message from there would splice bytes the peer sent in clear into
+  a message it began under encryption, and accept as complete a message it never
+  finished sending.  The backend whose teardown calls the remap directly latches
+  the same refusal in its own read path; this covers the other one, for which
+  the remap is the only notice the chunked layer gets. */
+
+  DEBUG(D_receive)
+    debug_printf("chunking transfer session gone: refusing the message\n");
+  bdat_session_gone = TRUE;
+  bdat_invalidate_receive_functions();
+  }
+#endif
+}
+
+
 int
 bdat_ungetc(int ch)
 {
 chunking_data_left++;
-bdat_push_receive_functions();  /* we're not done yet, calling push is safe, because it checks the state before pushing anything */
+
+/* We're not done yet, so a saved lower-layer vector has to be in place for the
+dispatch below.  bdat_getc() pops it as soon as a chunk runs out, so on the
+end-of-data path one has to be pushed back; on the header-reading path, and on
+the end-of-data path once a first character has been put back, one is already
+pushed and nothing is needed here.
+
+Push only in the first case.  The push reports a double push when it finds a
+vector already pushed, and rightly so: for a caller which means to save the
+top-level set, finding one already saved is a fault in this bookkeeping.  This
+caller does not mean that.  It needs some vector to dispatch through and does
+not care whether it is the one it would have saved, so asking for a push it does
+not need would report a fault that has not happened - and does happen here, on
+the header-reading path, for every header line a message has.  What the push
+reports is left exactly as it was for the callers that do mean it. */
+
+if (!lwr_receive_getc)
+  bdat_push_receive_functions();
+
+bdat_settle_receive_functions();
+
+/* Nothing will read the character back: the reader above reports the end of its
+input from here on.  Hold it here rather than pushing it into the plain socket's
+buffer, which has nothing of this message in it to put it back in front of. */
+
+if (bdat_session_gone) return ch;
+
 return lwr_receive_ungetc(ch);
 }
 
@@ -5270,7 +5512,9 @@ while (done <= 0)
 
     case BDAT_CMD:
       {
-      int n;
+      unsigned size;
+      BOOL last;
+      uschar * errmsg;
 
       HAD(SCH_BDAT);
       if (chunking_state != CHUNKING_OFFERED)
@@ -5282,14 +5526,13 @@ while (done <= 0)
 
       /* grab size, endmarker */
 
-      if (sscanf(CS smtp_cmd_data, "%u %n", &chunking_datasize, &n) < 1)
+      if (!bdat_parse_argument(&size, &last, &errmsg))
 	{
-	done = synprot_error(L_smtp_protocol_error, 501, NULL,
-	  US"missing size for BDAT command");
+	done = synprot_error(L_smtp_protocol_error, 501, NULL, errmsg);
 	break;
 	}
-      chunking_state = strcmpic(smtp_cmd_data+n, US"LAST") == 0
-	? CHUNKING_LAST : CHUNKING_ACTIVE;
+      chunking_datasize = size;
+      chunking_state = last ? CHUNKING_LAST : CHUNKING_ACTIVE;
       chunking_data_left = chunking_datasize;
       DEBUG(D_receive) debug_printf("chunking state '%s', %d bytes\n",
 			chunking_states[chunking_state], chunking_data_left);

@@ -1,0 +1,78 @@
+Subject: [oss-security] EXIM-Security-2026-07-31.1: Exim 4.100: remote
+ pre-authentication heap corruption in the GnuTLS chunked-transfer path
+To: oss-security <oss-security@lists.openwall.com>
+MIME-Version: 1.0
+Content-Transfer-Encoding: 8bit
+Content-Type: text/plain; charset=utf-8
+
+Dear Exim users,
+
+we have identified, by code inspection, a memory-safety defect in the
+GnuTLS-backed SMTP server: a TLS session torn down mid-transfer of a chunked
+body (BDAT, from the CHUNKING extension) frees the transfer buffer and destroys
+the session, while the readers bound to both stay installed and dispatched. A
+remote, unauthenticated attacker reaches it on a stock build - CHUNKING and
+STARTTLS are advertised by default - by ending a session mid-chunk with the
+socket left open, and the result is heap corruption, attacker-supplied bytes
+decoded into a freed allocation.
+
+Affected are GnuTLS-backend builds: the 4.100 development tree and all
+preceding releases that shipped that backend with CHUNKING support - a bound we
+cannot narrow, the earliest affected release not being establishable from the
+source tree alone. OpenSSL builds never release the buffer and so have no
+use-after-free: what their equivalent path would reach is a read with no
+session, and reaching it at all is closed here, in code the two backends share,
+with no OpenSSL source touched. Their own byte reader is left as it is, and
+with it the fall-through to the socket for the first byte after a session is
+lost. What that byte can lead to is closed all the same, in the same shared
+code: the chunked-body layer, finding the readers it saved naming a session
+which has gone, reports the end of its input, so an unfinished message is
+refused on either backend rather than completed from the socket in clear. The
+fail-closed behaviour described below therefore holds for both, with only the
+end-of-file channel it is reported through differing between them.
+
+The remediation gives the buffer, the session handle and the readers working
+through them one jointly enforced lifetime: both pointers are cleared as they
+are released, the saved chunked-body readers are re-pointed at the plain ones,
+transfer state is reset wherever a session is given a buffer, and each routine
+reading through either object fails closed. No API, ABI, wire protocol, spool
+format, option, default or chunking-state transition changes.
+
+One further defect found while reading the same path is corrected with it: the
+argument of a BDAT command is now checked in full before any of it is used. A
+negative or oversized size, or a stray word where the end marker belongs, used
+to be accepted and left the connection waiting for data that was never coming,
+until the receive timeout ended it. A size of digits and an optional end marker
+of LAST are what RFC 3030 gives, and now what is accepted; anything else is a
+syntax error with the chunking state left as it was.
+
+One change is visible to operators: a session lost while a message is still
+being received - a chunk still owed data, or a transaction that reached its
+sender or a recipient - now ends that message: the read path fails closed, the
+remainder is not taken from the socket in clear, the message is refused rather
+than accepted without the body it declared, and no further command is accepted
+on it. A terminal failure response still goes out in clear; a session
+ending with no message in progress, or one already refused, is unaffected - a
+peer that ends one meaning to go on using the socket is still answered, and the
+smtp transport's hosts_noproxy_tls handoff, which is such a peer, keeps working
+unchanged.
+
+The one workaround is a compensating control, not a fix: restricting
+chunking_advertise_hosts so CHUNKING is not advertised removes the trigger, at
+the cost of a standards-defined SMTP capability, and needs an explicit
+configuration action, the option defaulting to "*". For our handling of
+security releases and vendor backports see <https://wiki.exim.org/EximSecurity>
+and <https://wiki.exim.org/SecurityReleaseProcess>.
+
+No public identifier and no severity score are asserted: our assessment is
+code-derived and externally unverified, and no public record was retrievable.
+Identifiers found elsewhere in the tree are other, historical issues.
+
+2026-07-31: we identified the defect by code inspection
+2026-07-31: remediation prepared
+2026-08-03: remediation reviewed, revised and verified
+2026-08-04: remediation revised again, and its verification tightened
+~2026-08-05: publish the fix via the distros repo (for the distro packagers)
+~2026-08-08: publish the fix via the default repo (for the public)
+
+    The Exim maintainers

@@ -504,6 +504,11 @@ Returns:       the character
 int
 tls_ungetc(int ch)
 {
+/* A teardown that releases the buffer nulls it and resets the water marks, so
+check the pointer before the underflow test: a stale ungetc fails quietly. */
+
+if (!ssl_xfer_buffer) return ch;
+
 if (ssl_xfer_buffer_lwm <= 0)
   log_write_die(0, LOG_MAIN, "buffer underflow in tls_ungetc");
 

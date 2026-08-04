@@ -1,0 +1,106 @@
+# TLS server, TLS shutdown after a complete header line
+gnutls
+#
+# Companion to 2038, which stops the session while the first header line is still
+# incomplete.  Here the header line is finished before the session goes, and that
+# one byte of difference changes which part of the reading code sees the end of
+# the session: a line still being assembled reports a connection lost while
+# reading a header, whereas a line already complete reports one lost after a
+# header.  The second is the case a reader can get wrong in the more damaging
+# direction, because an end of file where the next header line could have begun -
+# or could have been a folded continuation of the line just read - is what a
+# message properly terminated by its last header also looks like.  Read as the
+# latter, the message would be accepted, and acknowledged to the peer, with none
+# of the body it declared: the peer is told the message arrived and so never
+# sends it again.  Nothing may be accepted here.
+#
+# Both ways of sending a message reach it, so both are exercised.  Under BDAT the
+# chunk is declared as 88 bytes and 22 are sent, so 66 are still outstanding when
+# the session ends; under DATA the headers are simply never closed by a blank
+# line and no terminating dot is ever sent.  Unlike 2038 the header line is sent
+# without the ">>> " prefix, so the client appends the CRLF that completes it.
+#
+# The reply is matched in full rather than as just "421", for the reason given in
+# 2038: the receive timeout answers with a 421 of its own, so a loose match would
+# also be satisfied by a server that went on reading and then gave up waiting.
+# The end of file after it is asserted for the same reason as there - a server
+# that answered and then left the socket usable would pass on the reply alone.
+#
+# Run this by hand the same way as 2038, with the GnuTLS build handed to runtest
+# and --tls left off:
+#
+#     cd test && ./runtest <gnutls-binary> --continue --test 2039
+#
+exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
+****
+#
+# Chunked body: the header line is complete, the chunk is not.
+#
+client-anytls 127.0.0.1 PORT_D
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+STARTTLS
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250 HELP
+MAIL FROM:<someone@some.domain>
+??? 250
+RCPT TO:<CALLER@test.ex>
+??? 250
+BDAT 88 LAST
+To: Susan@random.com
+stoptls
+??? 421 Lost incoming connection
+???*
+****
+millisleep 500
+#
+# Same again with DATA, which is the default way of sending a message and needs
+# no CHUNKING at all.
+#
+client-anytls 127.0.0.1 PORT_D
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+STARTTLS
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250 HELP
+MAIL FROM:<someone@some.domain>
+??? 250
+RCPT TO:<CALLER@test.ex>
+??? 250
+DATA
+??? 354
+To: Susan@random.com
+stoptls
+??? 421 Lost incoming connection
+???*
+****
+millisleep 500
+killdaemon
+#
+no_msglog_check

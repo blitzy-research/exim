@@ -80,6 +80,46 @@ JH/19 Support for DSCP, SOCKS, Proxy-Protocol and (the experimental) XCLIENT
 JH/20 Bug 3184: Disable the -bI:sieve command-line option when built without
       Sieve support.  Previously it was available but would crash.
 
+JH/21 Fix a use-after-free in the GnuTLS transfer buffer.  A TLS session shut
+      down during a chunked (BDAT) body transfer released the buffer and the
+      session, leaving the readers bound to them installed - including the set
+      saved by the chunked-body layer.  Those readers are now taken off the
+      released objects, both pointers are cleared as they are released, and the
+      routines reading through either fail closed.  A session lost while a
+      message is being received ends it rather than taking the rest in clear,
+      and its end of file is reported through the channel message reading
+      consults, so an unfinished message is refused with a lost-connection
+      response instead of being accepted without the body it declared.  The
+      chunked-body layer enforces the same on its own account: finding the
+      readers it saved naming a session which has gone, it reports the end of
+      its input rather than taking what the chunk still owes from the socket
+      underneath, which covers the other TLS backend too - that one never freed
+      the buffer, so it had no use-after-free, but it would have taken the rest
+      of such a message in clear.  A session ending with no message in progress
+      leaves the connection to carry on as it did before, which the smtp
+      transport relies on where hosts_noproxy_tls matches.
+
+JH/22 Check the whole argument of a BDAT command before using any of it.  The
+      size was read by a conversion which takes a sign and says nothing about
+      overflow, and whatever followed it was only compared with LAST, so a
+      negative or oversized size became a chunk of 4294967295 bytes and a stray
+      word where the end marker belongs became a chunk that was not the last.
+      Either way the connection was left waiting for data that was never coming,
+      until the receive timeout.  A size of digits and an optional end marker of
+      LAST are accepted, as RFC 3030 gives them; anything else is a syntax
+      error, refused with the chunking state unchanged.
+
+JH/23 Stop the chunked-body reader reporting two of its own diagnostics where
+      nothing was wrong.  It reports a double push when it finds a saved reader
+      vector already in place and a double pop when it finds none, which for a
+      caller meaning to save or to take away the top-level vector is a fault in
+      that bookkeeping - but three callers only need a vector present, or gone,
+      and asked unconditionally: a double push was reported once per header line
+      for every message received under CHUNKING, and a double pop for every
+      message whose last chunk was of zero size.  Those three now ask only when
+      there is something to do.  What either diagnostic reports is unchanged for
+      the callers that do mean it, and no reply or log line changes.
+
 
 Exim version 4.99.1
 -------------------
