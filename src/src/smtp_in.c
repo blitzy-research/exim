@@ -726,6 +726,75 @@ static inline void bdat_push_receive_functions(void);
 static inline void bdat_pop_receive_functions(void);
 
 
+/* Read the argument of a BDAT command.  RFC 3030 sect 2 gives the command as
+
+    bdat-cmd   = "BDAT" SP chunk-size [ SP end-marker ] CR LF
+    chunk-size = 1*DIGIT
+    end-marker = "LAST"
+
+The whole argument is checked here, and nothing is taken from it until it has
+all been accepted, so that a command which does not parse leaves the chunking
+state as it was rather than putting the connection into a chunk it can never
+complete.  A conversion which merely stops at the first character it cannot use
+is not enough for that: it takes a sign, says nothing about a value too large
+for the counter to hold, and leaves whatever follows the size unexamined.  So a
+negative or an oversized size became a chunk of 4294967295 bytes, and anything
+at all could stand where the end marker belongs and simply mean the marker was
+absent - either way leaving the connection waiting for data the peer was never
+going to send, until the receive timeout ended it.
+
+The size is not required to be separated from what follows it, and trailing
+whitespace is ignored rather than refused, both being accepted before.  A
+client which writes the marker means it, and reading it as absent would leave a
+message it said was complete unterminated.
+
+Arguments:
+  sizep		set to the chunk size, if the argument is accepted
+  lastp		set TRUE if the end marker is present, FALSE if it is not
+  errp		set to the text of the protocol error, if it is not
+
+Returns:	TRUE if the argument was accepted, else FALSE
+*/
+
+static BOOL
+bdat_parse_argument(unsigned * sizep, BOOL * lastp, uschar ** errp)
+{
+const uschar * s = smtp_cmd_data, * end;
+unsigned long size;
+
+if (!isdigit(*s))
+  {
+  *errp = US"missing size for BDAT command";
+  return FALSE;
+  }
+
+errno = 0;
+size = Ustrtoul(s, &end, 10);
+if (errno == ERANGE || size > UINT_MAX)
+  {
+  *errp = US"size too large for BDAT command";
+  return FALSE;
+  }
+
+s = end;
+Uskip_whitespace(&s);
+for (end = s + Ustrlen(s); end > s && isspace(end[-1]); ) end--;
+
+if (end == s)
+  *lastp = FALSE;
+else if (end - s == 4 && strncmpic(s, US"LAST", 4) == 0)
+  *lastp = TRUE;
+else
+  {
+  *errp = US"malformed end marker for BDAT command";
+  return FALSE;
+  }
+
+*sizep = (unsigned) size;
+return TRUE;
+}
+
+
 /* Get a byte from the smtp input, in CHUNKING mode.  Handle ack of the
 previous BDAT chunk and getting new ones when we run out.  Uses the
 underlying smtp_getc or tls_getc both for that and for getting the
@@ -764,7 +833,18 @@ for(;;)
   if (chunking_data_left > 0)
     return lwr_receive_getc(chunking_data_left--);
 
-  bdat_pop_receive_functions();
+  /* The chunk is exhausted, so take the saved vector back off: the next command
+  has to be read through the readers underneath this one.  Ask for the pop only
+  when there is a vector to pop.  This is reached twice with nothing pushed when
+  a message ends without a byte of body to read - a zero-sized last chunk gives
+  the headers loop and the body loop an immediate end of data each - and asking
+  for a pop there would report a fault that has not happened: what the pop
+  reports is a bookkeeping fault for a caller which means to take a saved vector
+  off, and this one only needs it off.  What the pop reports is left exactly as
+  it was for any caller that does mean it. */
+
+  if (lwr_receive_getc)
+    bdat_pop_receive_functions();
 #ifndef DISABLE_DKIM
   if (dkim_pause) dkim_pause(TRUE);
 #endif
@@ -848,16 +928,17 @@ next_cmd:
 
     case BDAT_CMD:
       {
-      int n;
+      unsigned size;
+      BOOL last;
+      uschar * errmsg;
 
-      if (sscanf(CS smtp_cmd_data, "%u %n", &chunking_datasize, &n) < 1)
+      if (!bdat_parse_argument(&size, &last, &errmsg))
 	{
-	(void) synprot_error(L_smtp_protocol_error, 501, NULL,
-	  US"missing size for BDAT command");
+	(void) synprot_error(L_smtp_protocol_error, 501, NULL, errmsg);
 	return ERR;
 	}
-      chunking_state = strcmpic(smtp_cmd_data+n, US"LAST") == 0
-	? CHUNKING_LAST : CHUNKING_ACTIVE;
+      chunking_datasize = size;
+      chunking_state = last ? CHUNKING_LAST : CHUNKING_ACTIVE;
       chunking_data_left = chunking_datasize;
       DEBUG(D_receive) debug_printf("chunking state '%s', %d bytes\n",
 			chunking_states[chunking_state], chunking_data_left);
@@ -917,7 +998,12 @@ while (chunking_data_left)
   if (!bdat_getbuf(&n)) break;
   }
 
-bdat_pop_receive_functions();
+/* As in bdat_getc() above: this caller needs the saved vector off rather than
+meaning to take it off, and the reader may already have taken it off when the
+chunk it was draining ran out.  Ask for the pop only when there is one to do. */
+
+if (lwr_receive_getc)
+  bdat_pop_receive_functions();
 chunking_state = CHUNKING_OFFERED;
 DEBUG(D_receive)
   debug_printf("chunking state '%s'\n", chunking_states[chunking_state]);
@@ -1045,12 +1131,23 @@ bdat_ungetc(int ch)
 {
 chunking_data_left++;
 
-/* We're not done yet, so the saved lower-layer vector has to be in place for
-the dispatch below.  bdat_getc() pops it as soon as a chunk runs out, so on the
-end-of-data path it has to be pushed back; on the header-reading path it is
-still pushed, and the push above then leaves the top-level set as it is. */
+/* We're not done yet, so a saved lower-layer vector has to be in place for the
+dispatch below.  bdat_getc() pops it as soon as a chunk runs out, so on the
+end-of-data path one has to be pushed back; on the header-reading path, and on
+the end-of-data path once a first character has been put back, one is already
+pushed and nothing is needed here.
 
-bdat_push_receive_functions();
+Push only in the first case.  The push reports a double push when it finds a
+vector already pushed, and rightly so: for a caller which means to save the
+top-level set, finding one already saved is a fault in this bookkeeping.  This
+caller does not mean that.  It needs some vector to dispatch through and does
+not care whether it is the one it would have saved, so asking for a push it does
+not need would report a fault that has not happened - and does happen here, on
+the header-reading path, for every header line a message has.  What the push
+reports is left exactly as it was for the callers that do mean it. */
+
+if (!lwr_receive_getc)
+  bdat_push_receive_functions();
 
 bdat_settle_receive_functions();
 
@@ -5358,7 +5455,9 @@ while (done <= 0)
 
     case BDAT_CMD:
       {
-      int n;
+      unsigned size;
+      BOOL last;
+      uschar * errmsg;
 
       HAD(SCH_BDAT);
       if (chunking_state != CHUNKING_OFFERED)
@@ -5370,14 +5469,13 @@ while (done <= 0)
 
       /* grab size, endmarker */
 
-      if (sscanf(CS smtp_cmd_data, "%u %n", &chunking_datasize, &n) < 1)
+      if (!bdat_parse_argument(&size, &last, &errmsg))
 	{
-	done = synprot_error(L_smtp_protocol_error, 501, NULL,
-	  US"missing size for BDAT command");
+	done = synprot_error(L_smtp_protocol_error, 501, NULL, errmsg);
 	break;
 	}
-      chunking_state = strcmpic(smtp_cmd_data+n, US"LAST") == 0
-	? CHUNKING_LAST : CHUNKING_ACTIVE;
+      chunking_datasize = size;
+      chunking_state = last ? CHUNKING_LAST : CHUNKING_ACTIVE;
       chunking_data_left = chunking_datasize;
       DEBUG(D_receive) debug_printf("chunking state '%s', %d bytes\n",
 			chunking_states[chunking_state], chunking_data_left);

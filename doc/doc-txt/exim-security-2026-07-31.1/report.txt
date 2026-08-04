@@ -42,9 +42,10 @@ of the chunk; a use-after-free read with no library involved at 4027; a
 one-byte use-after-free write in shared code at src/src/tls.c:510, past a guard
 a stale low-water mark defeats; the pending-data check and raw read
 dereferencing the destroyed session handle; and the ATRN state transplant
-leaving two contexts naming one object - buffer and session at 4414, which
-allocates nothing, session alone at 4446, which does allocate - so a second
-release was reachable there.
+leaving two contexts naming one object - the copy out of the server context at
+4414 duplicating both buffer and session and allocating nothing, while the copy
+into it at 4446 replaces the buffer at 4451 and so carries only the session
+across - so a second release was reachable there.
 
 Teardown reset only the top-level receive_* reader vector, and only for the
 server case (3978-3987) - never the saved lwr_receive_* vector, the one the
@@ -82,13 +83,26 @@ Availability, integrity and confidentiality are all affected; any severity
 characterisation here is code-derived, unverified against NVD, MITRE or any
 advisory.
 
-The OpenSSL backend differs: the buffer use-after-free does not arise there,
-that backend never releasing its transfer buffer, and its equivalent
-stale-reader path instead reaches a read with a NULL session - CWE-476, a crash
-of one forked process rather than heap corruption. That crash is closed too,
-the correction closing it being made in code the two backends share; its byte
-reader's own fall-through to the socket is left as it is, no OpenSSL source
-being touched.
+The OpenSSL backend differs, and how it differs is worth stating in full rather
+than leaving to be discovered. The buffer use-after-free does not arise there,
+that backend never releasing its transfer buffer, so what its equivalent
+stale-reader path would reach is a read with no session rather than released
+memory - at worst the loss of one forked process, not heap corruption. Reaching
+that path at all is closed here, the correction closing it lying in code the two
+backends share; no OpenSSL source is touched. We have not driven that backend to
+the loss itself, and do not claim to have: the statement is about what its code
+would reach, not about something observed.
+
+Its own byte reader is left as it is, and the fall-through to the socket lives
+there. So an OpenSSL build still reads on in clear when a session is lost while
+a chunk is owed data, and still accepts an unfinished message on the
+reproducer's dialogue - answering that the chunk arrived, and acknowledging a
+message the peer never finished sending. That was measured, and measured the
+same on this tree, on the unremediated one, and on the tree as it stood before
+this reading of the code began: it is neither introduced nor closed here.
+Closing it means editing that backend's own read path, which is outside what
+this changes; it is reported rather than fixed, and it is why the fail-closed
+behaviour described below is a property of GnuTLS builds.
 
 ================================================================================
 REMEDIATION
@@ -168,6 +182,22 @@ Buffer, session handle and the callbacks on both are given one joint lifetime.
     and a buffer is allocated only for a context that has none, as on the other
     backend.
 
+-   Separately, and in the same reading of the chunked-body path: the argument
+    of a BDAT command is now checked in full before any of it is used. It was
+    converted by something which stops at the first character it cannot use, so
+    it took a sign, said nothing about a value too large for the counter to
+    hold, and left whatever followed the size unexamined - meaning it need not
+    be the end marker to be read as its absence. A negative or an oversized
+    size therefore became a chunk of 4294967295 bytes, and a stray word where
+    the marker belongs became a chunk that was not the last; either way the
+    connection was put into a chunk it could never complete, and sat there until
+    the receive timeout ended it. What RFC 3030 gives is a size of digits and an
+    optional end marker which is the word LAST, and that is now what is
+    accepted; anything else is refused as a syntax error with the chunking state
+    left as it was, before the command could change it. Every well-formed
+    command, including the leniencies the previous conversion happened to allow,
+    is accepted exactly as before.
+
 Changes are confined to the TLS transfer-buffer lifetime logic and the
 chunked-body handling: src/src/tls-gnu.c, src/src/tls.c, src/src/smtp_in.c, and
 one added declaration in src/src/functions.h. Nothing changes in any public API
@@ -185,15 +215,16 @@ vendor backports see <https://wiki.exim.org/EximSecurity> and
 Behavioural Change
 --------------------------------------------------------------------------------
 
-A peer that takes its session down while a message is still being received - a
-chunk still owed data, or a transaction that had reached its sender or a
-recipient - is answered with end of file rather than having the rest read from
-the socket in clear; well-behaved clients finish or abandon a message inside the
-session and never reach it. A terminal 421 reporting the lost connection still
-goes out, in clear, before the close: the guarantee is about the read path, and
-about no further command being taken on the message that was being read. It is
-not that nothing at all is transmitted after, nor that a connection is closed
-where the loss found no message in progress or a message already refused.
+On a GnuTLS build - the backend this corrects - a peer that takes its session
+down while a message is still being received - a chunk still owed data, or a
+transaction that had reached its sender or a recipient - is answered with end
+of file rather than having the rest read from the socket in clear; well-behaved
+clients finish or abandon a message inside the session and never reach it. A
+terminal 421 reporting the lost connection still goes out, in clear, before the
+close: the guarantee is about the read path, and about no further command being
+taken on the message that was being read. It is not that nothing at all is
+transmitted after, nor that a connection is closed where the loss found no
+message in progress or a message already refused.
 
 Ending a session mid-connection and going on in clear is a documented mode of
 operation, not the behaviour this corrects: the smtp transport does it wherever
@@ -215,14 +246,55 @@ regression suite. The negative control is mandatory and ordered: the reproducer
 must fail on the unremediated tree first and pass only after the fix, and the
 pass criterion is the absence of any sanitizer report, not of a crash.
 
-Two of the unsafe paths are directly observable this way, and both were
-observed. On the unremediated tree the reproducer yields a heap-use-after-free
-WRITE of size 1 in tls_ungetc at src/src/tls.c:510 and a heap-use-after-free
-READ of size 1 in tls_getc at src/src/tls-gnu.c:4027, both into one allocation,
-released in tls_close (:3996, reached from tls_refill at :654) and allocated in
+Three witnesses are kept, all in test/scripts/2000-GnuTLS. Exactly one of them
+is the sanitizer negative control - 2040 - and which one that is matters,
+because the difference between them is the difference between reaching the
+released memory and stopping short of it.
+
+    2038  chunk short, first header line unfinished, nothing offered in clear
+    2039  chunk short, first header line finished; and the same under DATA
+    2040  chunk one byte short in the body, one byte offered in clear after
+          the session has gone            <- the sanitizer negative control
+
+All three fail on the unremediated tree and pass on this one - handed that
+tree's GnuTLS build, the harness reports all three failing, and handed this
+one's, all three passing. That is the ordered control for the suite. But only
+2040 fails there with a sanitizer report, which is the control the sanitizer
+needs, and the distinction is worth stating because a witness that reports
+nothing under the sanitizer cannot stand in for one that does.
+
+Why only 2040 reaches it. Reading a chunk after the session has gone falls
+through to the socket underneath, which teardown leaves open, so the read waits
+there. 2038 and 2039 offer nothing in clear, so unremediated it waits there with
+nothing to read until the receive timeout answers with a 421 of its own - a
+client with less patience than that sees no reply at all - and no sanitizer
+report arises: those two are witnesses that reading stops, not that memory was
+misused. 2040 offers one byte, which unremediated is taken as the last byte of
+the chunk: the chunk is then complete, the reader asks what follows it, is told
+the message ended, and - the body it was given not ending with a line ending -
+puts a character back to terminate it, through the reader belonging to the
+session that has gone and into the buffer released with it. So the byte offered
+in clear is not incidental to the reproducer; it is what makes it one.
+
+Two of the unsafe paths are directly observable this way, and both were observed
+by replaying 2040's client block verbatim against an instrumented daemon.
+Unremediated it yields a heap-use-after-free WRITE of size 1 in tls_ungetc at
+src/src/tls.c:510, reached from bdat_ungetc (src/src/smtp_in.c) and from
+read_message_bdat_smtp (src/src/receive.c), and a heap-use-after-free READ of
+size 1 in tls_getc at src/src/tls-gnu.c:4027, both into one allocation, released
+in tls_close (:3996, reached from tls_refill at :654) and allocated in
 tls_server_start (:3279). The read becomes reachable only once the write has
 moved the low-water mark, so a build that halts on the first error reports only
-the write. After the fix neither appears.
+the write; a build configured to carry on past one reports both. After the fix
+neither appears, with the sanitizer set to carry on so that nothing is hidden
+behind a first report.
+
+That same run shows the other thing this corrects, which the sanitizer does not
+report as an error at all: unremediated, the server answered "250- 85 byte
+chunk, total 87" and acknowledged the message. It counted the byte offered in
+clear as the body byte the peer never sent, and told the peer a message had
+arrived that had not. Remediated it answers that the connection was lost, and
+queues nothing.
 
 Three things the sanitizer cannot show: the up-to-4096-byte store GnuTLS itself
 performs into the released buffer, the write executing inside an uninstrumented
@@ -230,77 +302,151 @@ library; and the expired session handle and the second release on the
 transplant path, which the reproducer does not drive. All three are closed by
 the same change and argued from the code.
 
-The reproducer drives one client session against a daemon of its own. It
-declares a chunk of 88 bytes, sends 20 of them as an unfinished header line,
-and shuts the session down with the socket left open; the server must answer
-that the connection was lost and then be at end of file. The reply is matched
-in full rather than by its code, because unremediated the server reads on in
-clear, has nothing to read there, and answers only when the receive timeout
-expires - with a 421 of its own, which a loose match would accept, and which is
-what that tree produces. No run emitted a double-push or double-pop diagnostic.
+What 2038 and 2039 are for. Each declares a chunk of 88 bytes and sends part of
+it, then shuts the session down with the socket left open; the server must
+answer that the connection was lost and then be at end of file. 2039 covers the
+case one byte away from 2038's, where the header line is finished before the
+session goes. That single byte changes which part of the reading code sees the
+end of the session, and it is the case that can be got wrong in the more
+damaging direction: read as the end of a message, an unfinished one is accepted
+and acknowledged with none of its body. Both ways of sending a message reach it,
+so 2039 exercises the chunked path and the default one alike. In all three the
+reply is matched in full rather than by its code, because unremediated the
+server reads on in clear and answers only when the receive timeout expires -
+with a 421 of its own, which a loose match would accept. The end of file is
+asserted in 2038 and 2039, where nothing was offered in clear and the close is
+therefore clean, and not in 2040, where the byte offered is never consumed and
+the close carries a reset; there the reply and an empty queue are what is
+asserted.
 
-A second witness covers the case one byte away from that one, where the header
-line is finished before the session goes. That single byte changes which part of
-the reading code sees the end of the session, and it is the case that can be got
-wrong in the more damaging direction: read as the end of a message, an
-unfinished one is accepted and acknowledged with none of its body. Both ways of
-sending a message reach it, so the witness exercises the chunked path and the
-default one alike, each having to answer that the connection was lost and then
-be at end of file, with nothing accepted.
+Two diagnostics in the chunked-body reader deserve a note, because both were
+emitted where nothing was wrong. Each is about the vector that reader saves:
+the push reports a double push when it finds one already saved, and the pop
+reports a double pop when it finds none. For a caller which means to save or to
+take away the top-level set, either is a real fault in that bookkeeping. Three
+callers do not mean that. The put-back needs some vector to dispatch through
+and does not care whether it is the one it would have saved; the reader
+reaching the end of a chunk, and the drain of an abandoned one, need the saved
+vector gone rather than mean to take it away. All three now ask only when there
+is something to do. They had asked unconditionally, and so reported faults that
+had not happened: a double push once per header line for every message received
+under CHUNKING, and a double pop for every message whose last chunk was of zero
+size, that giving the headers loop and the body loop an end of data each with
+nothing left to pop between them. What either diagnostic reports is unchanged
+for the four callers that do mean it.
+
+With that corrected, no run emitted either diagnostic. Receive debugging was on
+for a normal single-chunk delivery, a multi-chunk one, a default-mode one, a
+zero-sized last chunk, each of the three witnesses' dialogues, the same
+dialogue as 2040's with nothing offered in clear, a burst of commands offered
+in clear after a session was lost mid-chunk, two sessions on one connection
+with a clear interval between them, eight malformed and two well-formed BDAT
+arguments, and ten repetitions of 2040's - thirty BDAT commands and nine
+accepted messages in one daemon - and none appeared. Before these two
+corrections the normal delivery produced two double pushes and the zero-sized
+last chunk one double pop - on the tree as it stood with the lifetime fix
+alone, and on the unremediated one, alike - while the reply to the zero-sized
+chunk is the same on all three trees.
 
 The regression witnesses behave as before, byte for byte: chunked reception and
 transmission with and without TLS, the state-transplant paths, signature
 verification, early pipelining, per-recipient data, and the multi-message
 connection re-use the smtp transport performs by ending a session and
 continuing in clear. No recorded output of any existing test is altered; the
-only outputs added are the reproducer's own. The automatic range is run on both
-trees, with both backends built, and compared: no test fails on the remediated
-tree that passes on the unremediated one.
+only outputs added are the witnesses' own.
 
-Four properties of the suite and of the environment it runs in are recorded
-here, none of them caused by this change and all of them reproducible on the
-unremediated tree, so that none is misread as a regression.
+--------------------------------------------------------------------------------
+How to invoke the suite, and what it leaves failing here
+--------------------------------------------------------------------------------
 
-Both witnesses need the daemon under test to be the GnuTLS build, so that
-binary is handed to the harness with the cross-library option left off:
+Three properties of the harness decide how it must be invoked. Getting any of
+them wrong produces long lists of convincing failures that have nothing to do
+with the code under test, so they are recorded before the results are.
 
-    cd test && ./runtest <gnutls-binary> --continue --test 2038 --test 2039
+Backend. A category written for one TLS backend must be run with that backend's
+build, handed to the harness with the cross-library option left off:
 
-Given that option the harness pairs the two library-specific builds against each
-other, leaving the OpenSSL build answering as the server - a build in which the
-defect does not arise. Thirteen pre-existing tests in the same category fail in
-that mode for the same reason. That server also answers this particular dialogue
-in a way no client can read: its own read path records an error without
-unregistering the session, so the terminal reply goes out through a session the
-peer has already dropped and the peer sees end of file instead. That is a
-property of that backend, unchanged here and outside what is edited; it is
-reported rather than fixed.
+    cd test && ./runtest <gnutls-binary>  --continue \
+                    --test 2038 --test 2039 --test 2040
+    cd test && ./runtest <gnutls-binary>  --continue --range 1100 1199
+    cd test && ./runtest <gnutls-binary>  --continue --range 2000 2099
+    cd test && ./runtest <openssl-binary> --continue --range 2100 2199
+    cd test && ./runtest <gnutls-binary>  --continue 1 8999
 
-The harness cannot be asked for test numbers from two script directories in one
-repeated-option invocation, so the state-transplant witnesses are run either as
-a range or as one invocation per directory.
+Given the cross-library option the harness pairs the two library-specific builds
+against each other, so "--tls gnutls" leaves the OpenSSL build answering as the
+server - a build in which this defect does not arise, and which answers the
+witnesses' dialogue in a way no client can read: its own read path records an
+error without unregistering the session, so the terminal reply goes out through
+a session the peer has already dropped and the peer sees end of file instead.
+That is a property of that backend, unchanged here and outside what is edited.
+It is reported rather than fixed, and it is why the option belongs to genuinely
+cross-library scenarios and not to the acceptance run: with it, thirteen
+pre-existing tests in the GnuTLS category fail alongside the three witnesses,
+where in native mode that whole category passes.
 
-One pre-existing test is nondeterministic on a host with several CPUs, and only
-on its saved client-side debug transcript: the proxy and continued-delivery
-children of a handed-on connection write their termination lines in whichever
-order they are scheduled, and the saved copy records one of the two orders, the
-process numbers substituted into the neighbouring lines shifting with it. It
-reproduces at the same rate on the unremediated tree, and became visible again
-here only because connection re-use, and so those two children, works as it did
-before. Its saved copy is left exactly as it stands: the test is not one this
-change touches, and rewriting a recorded output to settle a race that predates
-the change would blunt the very comparison it is being read for. The two-tree
-comparison above is therefore read against that race, and the discriminator for
-a real regression is the unremediated-tree run, which is why it is part of the
-procedure rather than an optional extra.
+Port block. The harness binds a fixed block of ports, so only one run at a time
+is possible per checkout and concurrent checkouts need distinct blocks. The
+block must also be one of four-digit ports, which the default is: one test's
+saved output goes through a normalisation in the harness itself that matches a
+four-digit port and no other, so a five-digit block makes that test fail on a
+port number the harness declined to normalise.
 
-A further set of tests fails identically on both trees for reasons of the host
-and the installed library versions - IPv6 being unavailable, and the TLS
-releases present being newer than the ones the saved outputs were recorded
-against. And the harness binds a fixed block of ports, so only one run at a
-time is possible per checkout and concurrent checkouts need distinct blocks;
-without that, ports held by another checkout produce convincing failures that
-have nothing to do with the code under test.
+Script directories. A single invocation cannot be asked for test numbers from
+two script directories, so tests spanning them - the state-transplant pair, and
+the early-pipelining group - are run as a range, or as one invocation per
+directory.
+
+Invoked that way, and with both backends built, the automatic range is run on
+this tree and on the unremediated one and the two are compared. No test fails
+here that passes there. The automatic range leaves fifteen failing on the GnuTLS
+build - 0630, 0632, 1090, 1166, 1167, 1199, 4506, 4510, 4517, 5000, 5705, 5706,
+5820, 5890, 5891 - the OpenSSL category adds 2136 and 2190, and the 1100-1199
+range run additionally shows 1157, which passes on its own and passed the full
+range. None is caused by this change. They are grouped by cause below, so that
+none is misread as a regression and nobody looks in this change for a reason
+that is not there.
+
+Absent IPv6 - the host has none, and the saved outputs record a daemon listening
+on it, or the harness's own helper creating a socket on it: 0632, 1167 and, in
+the OpenSSL category, 2136, whose forked-process numbers shift with the missing
+lines.
+
+TLS and crypto releases newer than the ones the saved outputs were recorded
+against: 1166 (a recv error the installed GnuTLS reports and the saved output
+predates), 1199 (its ALPN rejection text and deferral code), 5820 (one extra
+line of DANE debug), 5890 and 5891 (the description of a resumed session's
+cipher; 5890 also has a genuinely nondeterministic line, the library choosing
+per run whether to issue a fresh ticket, which was observed on both trees),
+4517 (signature bytes), and 4506 - whose saved output records the OpenSSL
+library's wording for an ASN.1 error, so it cannot match a GnuTLS build and does
+pass when the OpenSSL build is handed to the harness. In the OpenSSL category
+2190 is the installed OpenSSL release aborting in the mandatory-ALPN path.
+
+Scheduling order, on a host with several CPUs, and only in saved transcripts:
+1157 (the proxy and continued-delivery children of a handed-on connection write
+their termination lines in whichever order they are scheduled, the process
+numbers substituted into the neighbouring lines shifting with them - it passes
+standalone and passed the full range), 4510 (a delivery pair and an ACL line),
+5000 (which of two messages takes which maildir slot).
+
+The host's hints database: 0630's saved debug transcript has a line reporting
+that an address had no retry record, which this host does not produce.
+
+Saved outputs the suite does not ship: 1090 records nothing for the host's own
+answer to a kernel-setting query, and 5705 and 5706 record nothing for a server
+transcript their scripts always produce - as several of their siblings also do
+not.
+
+Every one of those is reproducible on the unremediated tree, and each failure
+report was compared between the two trees and found identical apart from the
+nondeterminism named above. None can be closed from here without either
+rewriting a recorded output for a test this change does not touch - which would
+blunt the very two-tree comparison it is being read for, and is why the
+harness's update option is never used - or an environment this one cannot
+provide. That is why the two-tree run is part of the procedure rather than an
+optional extra: the unremediated-tree result, not an empty failure list, is the
+discriminator for a real regression.
 
 ================================================================================
 STATUS AND IDENTIFIERS

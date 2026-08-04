@@ -94,6 +94,27 @@ JH/21 Fix a use-after-free in the GnuTLS transfer buffer.  A TLS session shut
       carry on as it did before, which the smtp transport relies on where
       hosts_noproxy_tls matches.
 
+JH/22 Check the whole argument of a BDAT command before using any of it.  The
+      size was read by a conversion which takes a sign and says nothing about
+      overflow, and whatever followed it was only compared with LAST, so a
+      negative or oversized size became a chunk of 4294967295 bytes and a stray
+      word where the end marker belongs became a chunk that was not the last.
+      Either way the connection was left waiting for data that was never coming,
+      until the receive timeout.  A size of digits and an optional end marker of
+      LAST are accepted, as RFC 3030 gives them; anything else is a syntax
+      error, refused with the chunking state unchanged.
+
+JH/23 Stop the chunked-body reader reporting two of its own diagnostics where
+      nothing was wrong.  It reports a double push when it finds a saved reader
+      vector already in place and a double pop when it finds none, which for a
+      caller meaning to save or to take away the top-level vector is a fault in
+      that bookkeeping - but three callers only need a vector present, or gone,
+      and asked unconditionally: a double push was reported once per header line
+      for every message received under CHUNKING, and a double pop for every
+      message whose last chunk was of zero size.  Those three now ask only when
+      there is something to do.  What either diagnostic reports is unchanged for
+      the callers that do mean it, and no reply or log line changes.
+
 
 Exim version 4.99.1
 -------------------

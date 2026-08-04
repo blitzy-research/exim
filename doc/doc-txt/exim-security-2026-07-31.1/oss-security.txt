@@ -20,8 +20,14 @@ Affected are GnuTLS-backend builds: the 4.100 development tree and all
 preceding releases that shipped that backend with CHUNKING support - a bound we
 cannot narrow, the earliest affected release not being establishable from the
 source tree alone. OpenSSL builds never release the buffer and so have no
-use-after-free; the crash their equivalent path yields is closed with it, their
-own byte reader being left as it is, no OpenSSL source touched.
+use-after-free: what their equivalent path would reach is a read with no
+session, and reaching it at all is closed here, in code the two backends share,
+with no OpenSSL source touched. Their own byte reader is left as it is, and
+with it the fall-through to the socket - so an OpenSSL build still reads on in
+clear when a session is lost with a chunk owed data, and still accepts an
+unfinished message. That is unchanged by this, measured the same on both trees,
+and closing it means editing that backend's read path, which this does not. The
+fail-closed behaviour described below is therefore a property of GnuTLS builds.
 
 The remediation gives the buffer, the session handle and the readers working
 through them one jointly enforced lifetime: both pointers are cleared as they
@@ -29,6 +35,14 @@ are released, the saved chunked-body readers are re-pointed at the plain ones,
 transfer state is reset wherever a session is given a buffer, and each routine
 reading through either object fails closed. No API, ABI, wire protocol, spool
 format, option, default or chunking-state transition changes.
+
+One further defect found while reading the same path is corrected with it: the
+argument of a BDAT command is now checked in full before any of it is used. A
+negative or oversized size, or a stray word where the end marker belongs, used
+to be accepted and left the connection waiting for data that was never coming,
+until the receive timeout ended it. A size of digits and an optional end marker
+of LAST are what RFC 3030 gives, and now what is accepted; anything else is a
+syntax error with the chunking state left as it was.
 
 One change is visible to operators: a session lost while a message is still
 being received - a chunk still owed data, or a transaction that reached its
@@ -55,7 +69,8 @@ Identifiers found elsewhere in the tree are other, historical issues.
 2026-07-31: we identified the defect by code inspection
 2026-07-31: remediation prepared
 2026-08-03: remediation reviewed, revised and verified
-~2026-08-04: publish the fix via the distros repo (for the distro packagers)
-~2026-08-07: publish the fix via the default repo (for the public)
+2026-08-04: remediation revised again, and its verification tightened
+~2026-08-05: publish the fix via the distros repo (for the distro packagers)
+~2026-08-08: publish the fix via the default repo (for the public)
 
     The Exim maintainers

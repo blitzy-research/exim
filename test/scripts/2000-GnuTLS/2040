@@ -1,0 +1,85 @@
+# TLS server, CHUNKING reception with TLS shutdown mid-body and a byte in clear
+gnutls
+#
+# The witness the sanitizer is driven with.  2038 and 2039 stop the session while
+# the headers are still being read; this one gets past them, into the body, and
+# then offers a byte in clear after the session has gone.  That last byte is what
+# makes this the one of the three which reaches the released memory on a server
+# without the fix, and having it reach that memory is the whole point: a
+# reproducer which passes before the fix as well as after it proves nothing.
+#
+# What that byte does there.  Reading the body finds the session gone and, with
+# nothing recorded to say so, falls through to the socket underneath - which is
+# still open, so the read waits.  With nothing offered it waits until the receive
+# timeout, which is where 2038 and 2039 end.  With one byte offered it returns,
+# and that byte is taken as the last of the chunk: the chunk is then complete, the
+# reader asks for what follows it, is told the message ended, and puts a character
+# back to terminate a body that did not end with a line ending - through the
+# reader belonging to the session that has gone, into the buffer released with it.
+#
+# Chunk arithmetic - 85 declared, 84 sent, so exactly one byte is outstanding when
+# the session goes, and the byte offered in clear is that one.  The ">>> " prefix
+# suppresses the trailing CRLF the client would otherwise add, so what is sent is
+# exactly the characters after it: two header lines, the empty line ending them,
+# and a body of 27 characters which does not end with a line ending.  Both of
+# those last two properties matter.  Headers that are finished put the reader on
+# the body path; a body that does not end with a line ending is what makes the
+# reader put a character back at the end of the message.
+#
+# The reply is matched in full rather than as just "421" because the receive
+# timeout answers with a 421 of its own, and a loose match would be satisfied by
+# the very behaviour this test exists to reject.
+#
+# Unlike 2038 and 2039 the end of file is not asserted here, and cannot be: the
+# byte offered in clear is never consumed, so the close carries a reset and the
+# client is not able to read past the reply.  The reply and an empty queue are
+# what is asserted instead - nothing may be accepted, the message being one byte
+# short of what the peer said it was sending.
+#
+# Note for running this by hand: as for 2038 and 2039, the daemon under test has
+# to be the GnuTLS build, so hand that binary to runtest and leave --tls off:
+#
+#     cd test && ./runtest <gnutls-binary> --continue --test 2040
+#
+# The reasons are given at length in 2038.  For the sanitizer run the harness is
+# not used at all - it makes a setuid copy of the binary, which a sanitized build
+# does not tolerate - so the client block below is replayed against a
+# non-setuid instrumented daemon started directly.  See the Verification section
+# of doc/doc-txt/exim-security-2026-07-31.1/report.txt.
+#
+exim -DSERVER=server -DSRV=tls -bd -oX PORT_D
+****
+#
+client-anytls 127.0.0.1 PORT_D
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250-STARTTLS
+??? 250 HELP
+STARTTLS
+??? 220
+EHLO rhu.barb
+??? 250-
+??? 250-SIZE
+??? 250-8BITMIME
+??? 250-PIPELINING
+??? 250-CHUNKING
+??? 250 HELP
+MAIL FROM:<someone@some.domain>
+??? 250
+RCPT TO:<CALLER@test.ex>
+??? 250
+BDAT 85 LAST
+>>> To: Susan@random.com\r\nFrom: Sam@random.com\r\n\r\nbody-start-AAAAAAAAAAAAAAAAAAAAAAAAAAA
+stoptls
+>>> X
+??? 421 Lost incoming connection
+****
+millisleep 500
+killdaemon
+#
+no_msglog_check
