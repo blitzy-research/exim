@@ -459,8 +459,11 @@ The kernel's TCP Fast Open state: 1090's saved log records the marker a delivery
 carries when Fast Open was used, which depends on whether a valid cookie is held
 for the destination at that moment. On this host it is held sometimes and not
 others - the same test passed and then failed on consecutive identical runs of
-the same build - and the same applies to 4058, which failed in one full range
-and passed in another. Both were seen to do this on either tree.
+the same build - and the same applies to 4058, which is not among the eleven
+because the run they were counted from happened to pass it; another run of the
+same build failed it, making twelve. Run five times each way, 4058 failed once
+in five on this tree and once in five on the unremediated one. Both tests were
+seen to do this on either tree.
 
 Scheduling order, on a host with several CPUs, and only in saved transcripts:
 0548 and 0999, which failed on the unremediated tree's run and passed on this
