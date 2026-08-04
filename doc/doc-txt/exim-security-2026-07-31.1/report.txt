@@ -94,15 +94,26 @@ the loss itself, and do not claim to have: the statement is about what its code
 would reach, not about something observed.
 
 Its own byte reader is left as it is, and the fall-through to the socket lives
-there. So an OpenSSL build still reads on in clear when a session is lost while
-a chunk is owed data, and still accepts an unfinished message on the
-reproducer's dialogue - answering that the chunk arrived, and acknowledging a
-message the peer never finished sending. That was measured, and measured the
-same on this tree, on the unremediated one, and on the tree as it stood before
-this reading of the code began: it is neither introduced nor closed here.
-Closing it means editing that backend's own read path, which is outside what
-this changes; it is reported rather than fixed, and it is why the fail-closed
-behaviour described below is a property of GnuTLS builds.
+there, so on that backend the first byte after a session is lost is still taken
+from the socket in clear. What that byte could lead to is closed all the same,
+and in the same shared code: the chunked-body layer, finding the readers it
+saved naming a session which has gone, reports the end of its input instead of
+asking for more. An unfinished message is therefore refused on either backend.
+
+This was measured on both trees, with an unremediated OpenSSL build and a
+remediated one answering the same dialogue. The unremediated one refused the
+message too, but by accident rather than by decision: its reader called the
+library with the session it had just given up, the library reported an error,
+and the error latch that error set is what ended the message. Remove the stale
+reader - which is what closing the use-after-free requires - and that accident
+goes with it, and the message would then be completed from whatever arrived in
+clear and accepted. The end-of-input report described above is what holds the
+refusal in place once the accident is gone; without it the correction would
+have traded a use-after-free on one backend for an accepted-in-clear message on
+the other. The fail-closed behaviour described below therefore holds for both,
+with only the end-of-file channel it is reported through differing between them:
+GnuTLS builds report it through the session's own channel, which this sets,
+while on OpenSSL builds the chunked layer's end of input carries it.
 
 ================================================================================
 REMEDIATION
@@ -135,6 +146,19 @@ Buffer, session handle and the callbacks on both are given one joint lifetime.
     settle it the same way before use, as does the pop that writes a saved
     reader back as a top-level one - neither depending on which backend tore
     the session down.
+
+-   That settlement also records what it found. A saved vector still naming the
+    session readers with no session active can only mean a chunk was in progress
+    when the session went, a vector being saved for no longer than one, and that
+    what the chunk still owes was never sent under the session it was promised
+    under. So the chunked readers report the end of their input from that point
+    rather than dispatching: no byte, and no buffer, is taken for the message
+    from the socket underneath, and a character put back is held rather than
+    pushed into a buffer holding none of this message. The record is cleared as
+    each transfer is pushed, a push being reached only by way of a command read
+    on a live connection, so a later chunk on a live session is unaffected.
+    This lives in the chunked-body layer rather than in either backend, and is
+    what makes an unfinished message refused on both of them.
 
 -   A read the session did not survive is failed closed wherever anything was
     still owed to the message being received - a chunk with data outstanding,
@@ -397,20 +421,26 @@ two script directories, so tests spanning them - the state-transplant pair, and
 the early-pipelining group - are run as a range, or as one invocation per
 directory.
 
+IPv6. It has to be there, in the kernel and in the build. On Linux the build's
+IPv6 support is an opt-in rather than something detected - the operating-system
+makefile leaves it commented out - and the saved outputs were recorded from a
+build that has it, several of them recording a daemon listening on it or the
+harness's own helper creating a socket on it. Built without it, three tests fail
+on lines that are simply absent, and the IPv6 categories are skipped. So the
+acceptance run is made with IPv6 enabled on the host and HAVE_IPV6=YES in the
+build configuration, which is how the numbers below were obtained.
+
 Invoked that way, and with both backends built, the automatic range is run on
 this tree and on the unremediated one and the two are compared. No test fails
-here that passes there. The automatic range leaves fifteen failing on the GnuTLS
-build - 0630, 0632, 1090, 1166, 1167, 1199, 4506, 4510, 4517, 5000, 5705, 5706,
-5820, 5890, 5891 - the OpenSSL category adds 2136 and 2190, and the 1100-1199
-range run additionally shows 1157, which passes on its own and passed the full
-range. None is caused by this change. They are grouped by cause below, so that
-none is misread as a regression and nobody looks in this change for a reason
-that is not there.
-
-Absent IPv6 - the host has none, and the saved outputs record a daemon listening
-on it, or the harness's own helper creating a socket on it: 0632, 1167 and, in
-the OpenSSL category, 2136, whose forked-process numbers shift with the missing
-lines.
+here that passes there. Of 1066 tests selected, this tree passes 899, skips 155
+for facilities the build or host does not provide, and leaves eleven failing on
+the GnuTLS build - 0630, 1090, 1166, 1199, 4506, 4517, 5705, 5706, 5820, 5890,
+5891 - with the OpenSSL category adding only 2190. The unremediated tree, run
+identically, passes 894 and leaves sixteen: those same eleven, the three
+witnesses, which is what they exist to do, and two which are nondeterministic
+and happened to fail there. None of the eleven is caused by this change. They
+are grouped by cause below, so that none is misread as a regression and nobody
+looks in this change for a reason that is not there.
 
 TLS and crypto releases newer than the ones the saved outputs were recorded
 against: 1166 (a recv error the installed GnuTLS reports and the saved output
@@ -418,25 +448,36 @@ predates), 1199 (its ALPN rejection text and deferral code), 5820 (one extra
 line of DANE debug), 5890 and 5891 (the description of a resumed session's
 cipher; 5890 also has a genuinely nondeterministic line, the library choosing
 per run whether to issue a fresh ticket, which was observed on both trees),
-4517 (signature bytes), and 4506 - whose saved output records the OpenSSL
-library's wording for an ASN.1 error, so it cannot match a GnuTLS build and does
-pass when the OpenSSL build is handed to the harness. In the OpenSSL category
-2190 is the installed OpenSSL release aborting in the mandatory-ALPN path.
+4517 (signature bytes - the headers it signs name this host, so no local name
+reproduces the recording host's), and 4506 - whose saved output records the
+OpenSSL library's wording for an ASN.1 error, so it cannot match a GnuTLS build
+and does pass when the OpenSSL build is handed to the harness. In the OpenSSL
+category 2190 is the installed OpenSSL release aborting in the mandatory-ALPN
+path, and it fails identically on both trees.
+
+The kernel's TCP Fast Open state: 1090's saved log records the marker a delivery
+carries when Fast Open was used, which depends on whether a valid cookie is held
+for the destination at that moment. On this host it is held sometimes and not
+others - the same test passed and then failed on consecutive identical runs of
+the same build - and the same applies to 4058, which failed in one full range
+and passed in another. Both were seen to do this on either tree.
 
 Scheduling order, on a host with several CPUs, and only in saved transcripts:
-1157 (the proxy and continued-delivery children of a handed-on connection write
-their termination lines in whichever order they are scheduled, the process
-numbers substituted into the neighbouring lines shifting with them - it passes
-standalone and passed the full range), 4510 (a delivery pair and an ACL line),
-5000 (which of two messages takes which maildir slot).
+0548 and 0999, which failed on the unremediated tree's run and passed on this
+one, and 4510 (a delivery pair and an ACL line) and 5000 (which of two messages
+takes which maildir slot), seen earlier in the same way. These are the two-tree
+comparison's noise floor, and the reason a failure is classified by re-running
+it on the other tree rather than by its presence in a list.
 
 The host's hints database: 0630's saved debug transcript has a line reporting
 that an address had no retry record, which this host does not produce.
 
 Saved outputs the suite does not ship: 1090 records nothing for the host's own
-answer to a kernel-setting query, and 5705 and 5706 record nothing for a server
-transcript their scripts always produce - as several of their siblings also do
-not.
+answer to the kernel-setting query its own script makes, which on a host where
+that tool is on the path prints the setting it made; and 5705 and 5706 record
+nothing for a server transcript their scripts always produce, while carrying
+neither a saved copy of it nor the directive which says not to compare one -
+every sibling of theirs with the same shape does carry that directive.
 
 Every one of those is reproducible on the unremediated tree, and each failure
 report was compared between the two trees and found identical apart from the

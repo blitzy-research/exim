@@ -23,11 +23,13 @@ source tree alone. OpenSSL builds never release the buffer and so have no
 use-after-free: what their equivalent path would reach is a read with no
 session, and reaching it at all is closed here, in code the two backends share,
 with no OpenSSL source touched. Their own byte reader is left as it is, and
-with it the fall-through to the socket - so an OpenSSL build still reads on in
-clear when a session is lost with a chunk owed data, and still accepts an
-unfinished message. That is unchanged by this, measured the same on both trees,
-and closing it means editing that backend's read path, which this does not. The
-fail-closed behaviour described below is therefore a property of GnuTLS builds.
+with it the fall-through to the socket for the first byte after a session is
+lost. What that byte can lead to is closed all the same, in the same shared
+code: the chunked-body layer, finding the readers it saved naming a session
+which has gone, reports the end of its input, so an unfinished message is
+refused on either backend rather than completed from the socket in clear. The
+fail-closed behaviour described below therefore holds for both, with only the
+end-of-file channel it is reported through differing between them.
 
 The remediation gives the buffer, the session handle and the readers working
 through them one jointly enforced lifetime: both pointers are cleared as they

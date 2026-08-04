@@ -89,10 +89,15 @@ JH/21 Fix a use-after-free in the GnuTLS transfer buffer.  A TLS session shut
       message is being received ends it rather than taking the rest in clear,
       and its end of file is reported through the channel message reading
       consults, so an unfinished message is refused with a lost-connection
-      response instead of being accepted without the body it declared.  A
-      session ending with no message in progress leaves the connection to
-      carry on as it did before, which the smtp transport relies on where
-      hosts_noproxy_tls matches.
+      response instead of being accepted without the body it declared.  The
+      chunked-body layer enforces the same on its own account: finding the
+      readers it saved naming a session which has gone, it reports the end of
+      its input rather than taking what the chunk still owes from the socket
+      underneath, which covers the other TLS backend too - that one never freed
+      the buffer, so it had no use-after-free, but it would have taken the rest
+      of such a message in clear.  A session ending with no message in progress
+      leaves the connection to carry on as it did before, which the smtp
+      transport relies on where hosts_noproxy_tls matches.
 
 JH/22 Check the whole argument of a BDAT command before using any of it.  The
       size was read by a conversion which takes a sign and says nothing about
